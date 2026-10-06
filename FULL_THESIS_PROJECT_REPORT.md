@@ -11,6 +11,8 @@
 * **Primary Sensor:** European Space Agency (ESA) Sentinel-1 C-Band SAR (5.405 GHz, Interferometric Wide Swath [IW], Ground Range Detected [GRD])
 * **Authentic Telemetry Benchmark:** UEIKAP Multi-Modal Maritime Benchmark (Zenodo DOI: [10.5281/zenodo.18391027](https://doi.org/10.5281/zenodo.18391027))
 
+> 🚀 **Quick Replication Guide:** For step-by-step instructions to set up and run this codebase on any fresh PC (Windows, Linux, macOS, Cloud GPU), see **[REPRODUCTION_GUIDE.md](REPRODUCTION_GUIDE.md)**.
+
 ---
 
 ## TABLE OF CONTENTS

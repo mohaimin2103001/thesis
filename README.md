@@ -10,8 +10,10 @@
 > **Sensor:** European Space Agency (ESA) Sentinel-1 C-Band SAR (5.405 GHz)  
 > **Benchmark:** Official UEIKAP Maritime Telemetry Benchmark ([Zenodo DOI: 10.5281/zenodo.18391027](https://doi.org/10.5281/zenodo.18391027))
 
-📖 **For the complete 17-section defense report with all hydrodynamic derivations, viva-voce questions, and full equations, see:**  
-👉 **[FULL_THESIS_PROJECT_REPORT.md](FULL_THESIS_PROJECT_REPORT.md)**
+📖 **Documentation & Full Report:**  
+* 📄 **Complete 17-Section Defense Report & Mathematical Physics:** 👉 **[FULL_THESIS_PROJECT_REPORT.md](FULL_THESIS_PROJECT_REPORT.md)**  
+* 🚀 **Zero-to-Hero Replication Manual (Any PC / OS Setup):** 👉 **[REPRODUCTION_GUIDE.md](REPRODUCTION_GUIDE.md)**  
+* 🎓 **Viva-Voce Examination Guide & Model Answers:** 👉 **[thesis_defense_guide.md](thesis_defense_guide.md)**  
 
 ---
 
