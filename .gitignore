@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Datasets (Strictly excluded: do not push dataset to GitHub)
+data/
+*.zip
+*.tar.gz
+*.tif
+*.tiff
+
+# Large Model Checkpoints (>100MB exceeds GitHub push limit)
+models/*.pt
+models/*.pth
+models/*.bin
+*.pt
+*.pth
+
+# Temporary / Extraction / Dump Files
+outputs/extracted_thesis_report.txt
+zenodo_*.json
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

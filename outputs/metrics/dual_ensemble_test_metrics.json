@@ -1,0 +1,19 @@
+{
+  "architecture": "Dual-Ensemble-ResNet18-ResNet34-TTA",
+  "test_acc": 0.6595744680851063,
+  "test_bal_acc": 0.5004219409282701,
+  "test_macro_f1": 0.49189189189189186,
+  "specificity": 0.7341772151898734,
+  "sensitivity": 0.26666666666666666,
+  "roc_auc": 0.42616033755274263,
+  "confusion_matrix": [
+    [
+      58,
+      21
+    ],
+    [
+      11,
+      4
+    ]
+  ]
+}

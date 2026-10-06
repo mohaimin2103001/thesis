@@ -1,0 +1,9 @@
+{
+  "architecture":"resnet34",
+  "mode":"binary",
+  "test_acc":0.5531914894,
+  "test_bal_acc":0.4371308017,
+  "test_macro_f1":0.427826087,
+  "test_auc":0.423628692,
+  "best_val_f1":0.6773074254
+}
