@@ -31,19 +31,18 @@ print("\n=== 2. INSTALLING DEPENDENCIES ===")
 print("\n=== 3. DOWNLOADING AUTHENTIC UEIKAP DATASET (~20s on Kaggle) ===")
 !mkdir -p data/raw data/processed data/interim
 !curl -L -C - "https://zenodo.org/records/18391027/files/UEIKAP_SAR.zip?download=1" -o data/raw/UEIKAP_SAR.zip
-!unzip -q data/raw/UEIKAP_SAR.zip -d data/raw/UEIKAP_SAR
-!python -c "
-import os, shutil
-raw = 'data/raw'
-tgt = os.path.join(raw, 'UEIKAP_SAR')
-for root, dirs, files in os.walk(raw):
-    if 'images' in dirs and root != tgt:
+!unzip -q -o data/raw/UEIKAP_SAR.zip -d data/raw/UEIKAP_SAR
+
+# Organize extracted folder in pure Python
+raw_dir = 'data/raw'
+tgt_dir = os.path.join(raw_dir, 'UEIKAP_SAR')
+for root, dirs, files in os.walk(raw_dir):
+    if 'images' in dirs and root != tgt_dir:
         for d in dirs:
             src_p = os.path.join(root, d)
-            dst_p = os.path.join(tgt, d)
+            dst_p = os.path.join(tgt_dir, d)
             if not os.path.exists(dst_p):
                 shutil.move(src_p, dst_p)
-"
 
 print("\n=== 4. PREPROCESSING WAKE MASKS & CENTERLINES (~25s) ===")
 !python -m src.data.ueikap_parser
