@@ -1,0 +1,25 @@
+# AIS-SAR Synchronization Configuration
+temporal_window_minutes: 20.0  # Search trajectory window: +/- 20 min
+
+thresholds_seconds:
+  tight: 60.0
+  standard: 120.0
+  broad: 300.0
+
+interpolation:
+  method: "linear_projected"
+  crs_metric: "EPSG:3857"  # Local projected metric coordinate system
+  min_points: 2
+
+rot:
+  decode_raw: true
+  special_values:
+    unavailable: -128
+    strong_starboard: 127
+    strong_port: -127
+  formula_divisor: 4.733
+
+satshipai_matching:
+  max_distance_meters: 1500.0
+  min_detection_confidence: 0.3
+  ambiguity_distance_ratio: 1.2

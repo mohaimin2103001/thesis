@@ -1,0 +1,22 @@
+# Wake Segmentation Configuration
+architecture: "Unet"
+encoder_name: "resnet34"
+encoder_weights: "imagenet"
+in_channels: 1
+classes: 1
+
+training:
+  img_size: [512, 512]
+  batch_size: 16
+  epochs: 40
+  lr: 0.0003
+  weight_decay: 0.0001
+  bce_weight: 0.5
+  dice_weight: 0.5
+  mixed_precision: true
+  early_stopping_patience: 10
+
+postprocessing:
+  min_component_area: 50
+  hole_fill_area: 100
+  morph_kernel_size: 3

@@ -11,7 +11,8 @@ ENV/
 env/
 
 # Datasets (Strictly excluded: do not push dataset to GitHub)
-data/
+/data/
+!src/data/
 *.zip
 *.tar.gz
 *.tif

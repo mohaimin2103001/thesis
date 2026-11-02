@@ -1,0 +1,42 @@
+# Path Configuration for SAR Vessel Maneuver Research Pipeline
+base_dir: "e:/thesis"
+
+raw_data:
+  ueikap_sar: "e:/thesis/data/raw/UEIKAP_SAR"
+  mmdec: "e:/thesis/data/raw/mmdec"
+  opensarwake: "e:/thesis/data/raw/opensarwake"
+
+interim_data:
+  ueikap_masks: "e:/thesis/data/interim/ueikap_masks"
+  mmdec_candidates: "e:/thesis/data/interim/mmdec_candidates"
+  mmdec_crops: "e:/thesis/data/interim/mmdec_crops"
+  mmdec_probability_maps: "e:/thesis/data/interim/mmdec_probability_maps"
+  mmdec_predicted_masks: "e:/thesis/data/interim/mmdec_predicted_masks"
+  cleaned_masks: "e:/thesis/data/interim/cleaned_masks"
+  centerlines: "e:/thesis/data/interim/centerlines"
+  geometry: "e:/thesis/data/interim/geometry"
+
+processed_data:
+  master_parquet: "e:/thesis/data/processed/maneuver_master.parquet"
+  image_only_subset: "e:/thesis/data/processed/image_only_subset.parquet"
+  wake_only_subset: "e:/thesis/data/processed/wake_only_subset.parquet"
+  geometry_subset: "e:/thesis/data/processed/geometry_subset.parquet"
+  direction_subset: "e:/thesis/data/processed/direction_subset.parquet"
+  rot_regression_subset: "e:/thesis/data/processed/rot_regression_subset.parquet"
+  splits_dir: "e:/thesis/data/processed/splits"
+  rejected_dir: "e:/thesis/data/rejected"
+
+checkpoints:
+  segmenter: "e:/thesis/checkpoints/segmenter"
+  image_baseline: "e:/thesis/checkpoints/image_baseline"
+  wake_only: "e:/thesis/checkpoints/wake_only"
+  geometry_only: "e:/thesis/checkpoints/geometry_only"
+  fusion: "e:/thesis/checkpoints/fusion"
+  fusion_physics: "e:/thesis/checkpoints/fusion_physics"
+
+outputs:
+  predictions: "e:/thesis/predictions"
+  logs: "e:/thesis/logs"
+  figures: "e:/thesis/figures"
+  tables: "e:/thesis/tables"
+  manuscript: "e:/thesis/manuscript"

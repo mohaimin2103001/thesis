@@ -1,0 +1,26 @@
+# Geometry-Only Model Configuration
+feature_columns:
+  - wake_length
+  - wake_orientation
+  - mean_curvature
+  - median_curvature
+  - max_abs_curvature
+  - signed_mean_curvature
+  - curvature_std
+  - wake_asymmetry
+  - mask_area
+  - geometry_confidence
+
+input_dim: 10
+hidden_dims: [128, 64, 32]
+dropout: 0.2
+
+training:
+  batch_size: 32
+  epochs: 80
+  lr: 0.001
+  weight_decay: 0.001
+  loss_weights:
+    state: 1.0
+    direction: 1.0
+    rot: 0.5

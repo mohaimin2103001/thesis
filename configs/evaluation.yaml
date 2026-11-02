@@ -1,0 +1,30 @@
+# Evaluation, Counterfactuals, Uncertainty & Robustness Configuration
+
+splits:
+  group_by: ["mmsi", "product_id"]  # Zero leakage across train, val, test
+  test_ratio: 0.2
+  val_ratio: 0.15
+
+counterfactual_tests:
+  wake_removal:
+    description: "Mask out detected wake pixels and evaluate performance drop"
+  hull_removal:
+    description: "Mask out vessel hull pixels and evaluate wake-only reliance"
+  wake_mirroring:
+    description: "Mirror wake geometry laterally; test if Port <-> Starboard and sign(ROT) flip"
+  wake_straightening:
+    description: "Artificially straighten curved centerlines; verify |ROT| prediction shrinks"
+
+uncertainty:
+  mc_dropout_samples: 30
+  dropout_rate: 0.3
+  metrics:
+    - predictive_entropy
+    - expected_calibration_error
+    - brier_score
+    - rot_predictive_std
+
+robustness_tests:
+  speckle_noise_levels: [0.0, 0.05, 0.1, 0.2, 0.3]
+  contrast_factors: [1.0, 0.8, 0.6, 0.4]
+  downsampling_factors: [1, 2, 4]

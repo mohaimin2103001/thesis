@@ -1,0 +1,6 @@
+Model,State_F1,State_BalAcc,Dir_F1,ROT_MAE,ROT_R2
+Full SAR Image-Only,0.742,0.685,0.582,2.14,0.31
+Segmented Wake-Only,0.778,0.71,0.634,1.82,0.44
+Wake Geometry-Only (MLP),0.761,0.694,0.715,1.65,0.52
+Visual-Geometry Fusion,0.834,0.782,0.812,1.28,0.67
+Fusion + Physics Guidance,0.856,0.814,0.849,1.12,0.74

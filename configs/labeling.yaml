@@ -1,0 +1,31 @@
+# Maneuver Labeling Configuration
+primary_threshold_deg_min: 0.5
+
+sensitivity_thresholds_deg_min:
+  - 0.25
+  - 0.50
+  - 1.00
+
+min_sog_knots: 2.0  # Eliminate moored or drifting vessels
+
+deadband_rules:
+  straight:
+    abs_rot_max: 0.5
+    abs_drift_max: 5.0
+  turning:
+    abs_rot_min: 0.5
+    abs_drift_min: 10.0
+
+handedness:
+  port_convention: "negative"        # ROT < -tau -> Port / Left
+  starboard_convention: "positive"  # ROT > +tau -> Starboard / Right
+
+quality_tiers:
+  gold_a:
+    description: "Reliable continuous ROT, bracketing time match <= 120s, unambiguous ship detection"
+    allowed_tasks: ["state_classification", "direction_classification", "rot_regression"]
+  gold_b:
+    description: "Categorical turn (+/-127 or 120-300s window), direction valid but exact magnitude unavailable"
+    allowed_tasks: ["state_classification", "direction_classification"]
+  reject:
+    description: "ROT unavailable (-128), >300s time gap, position interpolation failure, ambiguous multi-ship match"

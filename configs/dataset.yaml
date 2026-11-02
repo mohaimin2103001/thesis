@@ -1,0 +1,24 @@
+# Dataset Configuration
+seed: 42
+
+datasets:
+  ueikap:
+    name: "UEIKAP_DATASET"
+    doi: "10.5281/zenodo.18391027"
+    zenodo_record: 18391027
+    role: "wake_segmentation_supervision"
+    image_size: [512, 512]
+    expected_md5: "356148359a9ae6b7ae3d3cec2fb61304"
+
+  mmdec:
+    name: "MMDEC"
+    doi: "10.5281/zenodo.17491518"
+    zenodo_record: 17491518
+    role: "maneuver_ground_truth_large_sar"
+    date_range: ["2023-07-01", "2023-09-30"]
+    coverage_area: ["Celtic Sea", "English Channel", "North Sea"]
+
+  opensarwake:
+    name: "OpenSARWake"
+    repo: "libzzluo/OpenSARWake"
+    role: "auxiliary_wake_localization"
