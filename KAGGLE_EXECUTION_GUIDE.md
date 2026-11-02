@@ -28,8 +28,29 @@ print("=== 1. CLONING THESIS REPOSITORY ===")
 print("\n=== 2. INSTALLING DEPENDENCIES ===")
 !pip install -q pyarrow scikit-image shapely pyyaml timm albumentations segmentation-models-pytorch onnx onnxruntime
 
-print("\n=== 3. EXECUTING KAGGLE MASTER GPU TRAINING PIPELINE ===")
-# Trains:
+print("\n=== 3. DOWNLOADING AUTHENTIC UEIKAP DATASET (~20s on Kaggle) ===")
+!mkdir -p data/raw data/processed data/interim
+!curl -L -C - "https://zenodo.org/records/18391027/files/UEIKAP_SAR.zip?download=1" -o data/raw/UEIKAP_SAR.zip
+!unzip -q data/raw/UEIKAP_SAR.zip -d data/raw/UEIKAP_SAR
+!python -c "
+import os, shutil
+raw = 'data/raw'
+tgt = os.path.join(raw, 'UEIKAP_SAR')
+for root, dirs, files in os.walk(raw):
+    if 'images' in dirs and root != tgt:
+        for d in dirs:
+            src_p = os.path.join(root, d)
+            dst_p = os.path.join(tgt, d)
+            if not os.path.exists(dst_p):
+                shutil.move(src_p, dst_p)
+"
+
+print("\n=== 4. PREPROCESSING WAKE MASKS & CENTERLINES (~25s) ===")
+!python -m src.data.ueikap_parser
+!python -m src.data.build_master_dataset
+
+print("\n=== 5. EXECUTING KAGGLE MASTER GPU TRAINING PIPELINE ===")
+# Trains on GPU:
 # 1. Image-Only Baseline (ResNet-34)
 # 2. Wake-Only Baseline (Masked SAR)
 # 3. Geometry-Only Baseline (MLP on Signed Curvatures)
@@ -37,11 +58,11 @@ print("\n=== 3. EXECUTING KAGGLE MASTER GPU TRAINING PIPELINE ===")
 # 5. Physics-Guided Fusion Model (ROT ~ v * kappa)
 !python kaggle/KAGGLE_MASTER_TRAINING.py
 
-print("\n=== 4. PACKAGING TRAINED CHECKPOINTS ===")
+print("\n=== 6. PACKAGING TRAINED CHECKPOINTS ===")
 !zip -r /kaggle/working/thesis_results.zip checkpoints/ data/processed/ configs/
 
 print("\n" + "=" * 65)
-print("SUCCESS! All 5 research models trained and checkpoints saved.")
+print("SUCCESS! All 5 research models trained on GPU and checkpoints saved.")
 print("Download '/kaggle/working/thesis_results.zip' from Output on the right!")
 print("=" * 65)
 ```
@@ -57,8 +78,8 @@ print("=" * 65)
 
 ## Step 4: Resume Here on Your Local PC
 1. Extract `thesis_results.zip` on your computer.
-2. Copy the extracted folders (`models/`, `outputs/`, `data/processed/`) into your workspace:
-   * Copy `models/*` into `e:\thesis\models\`
-   * Copy `outputs/*` into `e:\thesis\outputs\`
+2. Copy the extracted folders (`checkpoints/`, `data/processed/`) into your workspace:
+   * Copy `checkpoints/*` into `e:\thesis\checkpoints\`
+   * Copy `data/processed/*` into `e:\thesis\data\processed\`
 3. Come back to this chat and say **"I have pasted the files"** or **"resume"**!
-   * We will immediately verify the model checkpoints and show you all the generated performance curves, confusion matrices, and Grad-CAM visualizations.
+   * We will immediately run the frozen test evaluations and generate all remaining publication figures and tables.

@@ -39,6 +39,21 @@ GEOMETRY_COLS = [
     "wake_asymmetry", "mask_area", "geometry_confidence"
 ]
 
+
+def resolve_path(p):
+    if not p or not isinstance(p, str):
+        return p
+    if os.path.exists(p):
+        return p
+    fname = os.path.basename(p.replace("\\", "/"))
+    for base in ["data/raw/UEIKAP_SAR/images", "data/interim/ueikap_masks", "data/raw", "data/interim"]:
+        if os.path.exists(base):
+            for root, _, files in os.walk(base):
+                if fname in files:
+                    return os.path.join(root, fname)
+    return p
+
+
 class SARMultiTaskDataset(Dataset):
     def __init__(self, df, mode="fusion", img_size=(384, 384)):
         self.df = df.reset_index(drop=True)
@@ -58,7 +73,8 @@ class SARMultiTaskDataset(Dataset):
         row = self.df.iloc[idx]
 
         # 1. Visual input
-        img = cv2.imread(row["original_image_path"])
+        img_p = resolve_path(row["original_image_path"])
+        img = cv2.imread(img_p)
         if img is None:
             img = np.zeros((self.img_size[0], self.img_size[1], 3), dtype=np.uint8)
         else:
@@ -66,7 +82,8 @@ class SARMultiTaskDataset(Dataset):
 
         # Wake-only mode masks out background ocean
         if self.mode == "wake_only":
-            mask = cv2.imread(row["wake_mask_path"], cv2.IMREAD_GRAYSCALE)
+            mask_p = resolve_path(row["wake_mask_path"])
+            mask = cv2.imread(mask_p, cv2.IMREAD_GRAYSCALE)
             if mask is not None:
                 mask = cv2.resize(mask, self.img_size, interpolation=cv2.INTER_NEAREST)
                 img = cv2.bitwise_and(img, img, mask=(mask > 127).astype(np.uint8))
