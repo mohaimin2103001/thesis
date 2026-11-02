@@ -10,13 +10,23 @@ venv/
 ENV/
 env/
 
-# Datasets (Strictly excluded: do not push dataset to GitHub)
-/data/
-!src/data/
+# Datasets (Exclude heavy raw and big images, but include processed parquet tables and small masks)
+/data/raw/
+/data/processed/wake_segmentation_kaggle/images/
 *.zip
 *.tar.gz
 *.tif
 *.tiff
+!data/processed/
+!data/processed/*.parquet
+!data/processed/*.csv
+!data/processed/*.json
+!data/processed/splits/
+!data/processed/splits/*.parquet
+!data/interim/ueikap_masks/
+!data/interim/ueikap_masks/*.png
+!data/rejected/
+!data/rejected/*.parquet
 
 # Large Model Checkpoints (>100MB exceeds GitHub push limit)
 models/*.pt

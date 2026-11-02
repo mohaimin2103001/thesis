@@ -1,0 +1,28 @@
+column_name,dtype,units,meaning,source,can_be_model_input,is_target,is_analysis_only
+sample_id,string,identifier,Unique chip-vessel sample identifier,Internal,NO,NO,YES
+source_dataset,string,category,Source telemetry benchmark (UEIKAP / MMDEC),Dataset,NO,NO,YES
+product_id,string,identifier,Sentinel-1 orbit pass identifier,ESA S1,NO,NO,YES
+original_image_path,string,filepath,Path to Sentinel-1 SAR image chip,Filesystem,YES,NO,NO
+sar_time,timestamp,UTC,Observation satellite capture time,Telemetry,NO,NO,YES
+mmsi,string,identifier,Maritime Mobile Service Identity (grouped splitting),AIS,NO (STRICT RULE),NO,YES
+latitude,float64,degrees,Vessel latitude at SAR time,AIS,NO,NO,YES
+longitude,float64,degrees,Vessel longitude at SAR time,AIS,NO,NO,YES
+sog,float32,knots,Speed Over Ground (used only for physics regularization in training),AIS,NO (FINAL MODEL INPUT FORBIDDEN),NO,YES
+cog,float32,degrees,Course Over Ground,AIS,NO,NO,YES
+heading,float32,degrees,True vessel heading,AIS,NO,NO,YES
+course_heading_drift,float32,degrees,Circular difference between COG and Heading,Derived AIS,NO,NO,YES
+rot_raw,float32,AIS code,Raw decoded Rate of Turn telemetry,AIS,NO,NO,YES
+rot_deg_min,float32,deg/min,Physical Rate of Turn,AIS,NO,NO,YES
+rot_target,float32,deg/min,Continuous Signed ROT target for regression head,Ground Truth,NO,YES (TARGET C),NO
+state,category,class,Straight (0) vs Turning (1),Ground Truth,NO,YES (TARGET A),NO
+direction,category,class,Port (0) vs Starboard (1) [turning vessels],Ground Truth,NO,YES (TARGET B),NO
+wake_mask_path,string,filepath,Path to binary wake segmentation mask,Segmentation,YES,NO,NO
+wake_length,float32,pixels,Arc length of visible wake centerline,Wake Geometry,YES (GEOMETRY),NO,NO
+wake_orientation,float32,degrees,Overall orientation angle of wake chord,Wake Geometry,YES (GEOMETRY),NO,NO
+mean_curvature,float32,1/px,Mean absolute planar curvature along wake,Wake Geometry,YES (GEOMETRY),NO,NO
+max_abs_curvature,float32,1/px,Peak localized curvature on centerline,Wake Geometry,YES (GEOMETRY),NO,NO
+signed_mean_curvature,float32,1/px,Analytical signed curvature matching Starboard(+) vs Port(-),Wake Geometry,YES (GEOMETRY),NO,NO
+curvature_std,float32,1/px,Curvature variance along centerline,Wake Geometry,YES (GEOMETRY),NO,NO
+wake_asymmetry,float32,unitless,Lateral area displacement from chord,Wake Geometry,YES (GEOMETRY),NO,NO
+geometry_confidence,float32,"score [0,1]",Confidence of extracted skeleton graph,Wake Geometry,YES (GEOMETRY),NO,NO
+split,category,split,Leakage-free partition (train / val / test),MMSI Grouping,NO,NO,YES

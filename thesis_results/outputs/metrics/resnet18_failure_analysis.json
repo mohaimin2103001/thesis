@@ -1,0 +1,198 @@
+{
+  "total_test_samples": 94,
+  "total_misclassifications": 17,
+  "error_rate": 0.18085106382978725,
+  "taxonomy_counts": {
+    "Wake Dissipation / Ambiguous Temporal Latency": 15,
+    "Pure Drift without Rudder Deflection (Lateral wind/current displacement)": 2
+  },
+  "misclassified_samples": [
+    {
+      "image_id": "DAN_S1A_20240401T054138_TC_Sub1_crop46_FalseColorVVVH_255806256",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240401T054138_TC_Sub1_crop46_FalseColorVVVH_255806256.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.5603142976760864,
+      "sog_knots": 9.5,
+      "rot_deg_min": -2.2,
+      "drift_angle": 4.099999999999994,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240303T053315_TC_Sub1_crop7_FalseColorVVVH_266235000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240303T053315_TC_Sub1_crop7_FalseColorVVVH_266235000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.6125507354736328,
+      "sog_knots": 9.6,
+      "rot_deg_min": -2.9,
+      "drift_angle": -0.3000000000000113,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240301T170225_TC_Sub2_crop35_FalseColorVVVH_256717000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240301T170225_TC_Sub2_crop35_FalseColorVVVH_256717000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.6089685559272766,
+      "sog_knots": 9.4,
+      "rot_deg_min": 0.0,
+      "drift_angle": -10.0,
+      "failure_mechanism": "Pure Drift without Rudder Deflection (Lateral wind/current displacement)"
+    },
+    {
+      "image_id": "DAN_S1A_20240308T054047_TC_Sub2_crop70_FalseColorVVVH_257720000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240308T054047_TC_Sub2_crop70_FalseColorVVVH_257720000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.5317833423614502,
+      "sog_knots": 11.9,
+      "rot_deg_min": -1.1,
+      "drift_angle": -2.4000000000000057,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240303T053315_TC_Sub1_crop5_FalseColorVVVH_244181000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240303T053315_TC_Sub1_crop5_FalseColorVVVH_244181000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.6313289403915405,
+      "sog_knots": 6.3,
+      "rot_deg_min": 0.0,
+      "drift_angle": 14.5,
+      "failure_mechanism": "Pure Drift without Rudder Deflection (Lateral wind/current displacement)"
+    },
+    {
+      "image_id": "DAN_S1A_20240401T054048_TC_Sub2_crop60_FalseColorVVVH_229077000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240401T054048_TC_Sub2_crop60_FalseColorVVVH_229077000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.567942202091217,
+      "sog_knots": 18.6,
+      "rot_deg_min": -1.1,
+      "drift_angle": 0.3000000000000113,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240401T165301_TC_Sub1_crop7_FalseColorVVVH_211911000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240401T165301_TC_Sub1_crop7_FalseColorVVVH_211911000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.6690142750740051,
+      "sog_knots": 20.9,
+      "rot_deg_min": 10.0,
+      "drift_angle": 0.1000000000000227,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240313T170225_TC_Sub2_crop21_FalseColorVVVH_220223000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240313T170225_TC_Sub2_crop21_FalseColorVVVH_220223000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.6327022314071655,
+      "sog_knots": 17.8,
+      "rot_deg_min": 1.1,
+      "drift_angle": -1.8000000000000114,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_ S1A_20240406T054923_TC_sub2_crop3_FalseColorVVVH_218816000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_ S1A_20240406T054923_TC_sub2_crop3_FalseColorVVVH_218816000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.6756045818328857,
+      "sog_knots": 13.0,
+      "rot_deg_min": 3.6,
+      "drift_angle": -2.0,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240401T054048_TC_Sub2_crop108_FalseColorVVVH_374677000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240401T054048_TC_Sub2_crop108_FalseColorVVVH_374677000.png",
+      "ground_truth": "Straight",
+      "predicted": "Turning",
+      "confidence": 0.5081390142440796,
+      "sog_knots": 10.5,
+      "rot_deg_min": 0.0,
+      "drift_angle": -0.1000000000000227,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240403T052503_TC_Sub1_crop47_FalseColorVVVH_246553000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240403T052503_TC_Sub1_crop47_FalseColorVVVH_246553000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.6560301780700684,
+      "sog_knots": 12.6,
+      "rot_deg_min": -2.9,
+      "drift_angle": 0.0,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240313T054857_TC_Sub1_crop24_FalseColorVVVH_219358000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240313T054857_TC_Sub1_crop24_FalseColorVVVH_219358000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.6534247398376465,
+      "sog_knots": 16.0,
+      "rot_deg_min": -2.2,
+      "drift_angle": 3.0999999999999943,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240308T165415_TC_Sub1_crop17_FalseColorVVVH_219437000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240308T165415_TC_Sub1_crop17_FalseColorVVVH_219437000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.586235761642456,
+      "sog_knots": 19.8,
+      "rot_deg_min": 1.1,
+      "drift_angle": -0.5999999999999943,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240308T054047_TC_Sub2_crop91_FalseColorVVVH_511101289",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240308T054047_TC_Sub2_crop91_FalseColorVVVH_511101289.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.6517292857170105,
+      "sog_knots": 12.9,
+      "rot_deg_min": -1.1,
+      "drift_angle": 2.0,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240313T054857_TC_Sub1_crop2_FalseColorVVVH_215458000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240313T054857_TC_Sub1_crop2_FalseColorVVVH_215458000.png",
+      "ground_truth": "Straight",
+      "predicted": "Turning",
+      "confidence": 0.520925760269165,
+      "sog_knots": 11.9,
+      "rot_deg_min": 0.0,
+      "drift_angle": 3.9000000000000057,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240401T165326_TC_Sub1_crop59_FalseColorVVVH_538004380",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240401T165326_TC_Sub1_crop59_FalseColorVVVH_538004380.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.674497663974762,
+      "sog_knots": 10.5,
+      "rot_deg_min": 2.9,
+      "drift_angle": -0.6999999999999886,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    },
+    {
+      "image_id": "DAN_S1A_20240301T170225_TC_Sub2_crop27_FalseColorVVVH_265410000",
+      "image_path": "/kaggle/working/thesis/data/raw/UEIKAP_SAR/images/test/DAN_S1A_20240301T170225_TC_Sub2_crop27_FalseColorVVVH_265410000.png",
+      "ground_truth": "Turning",
+      "predicted": "Straight",
+      "confidence": 0.7189539670944214,
+      "sog_knots": 19.3,
+      "rot_deg_min": -2.2,
+      "drift_angle": 2.6999999999999886,
+      "failure_mechanism": "Wake Dissipation / Ambiguous Temporal Latency"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "architecture":"resnet18",
+  "mode":"binary",
+  "test_acc":0.6276595745,
+  "test_bal_acc":0.535443038,
+  "test_macro_f1":0.5035460993,
+  "test_auc":0.4438818565,
+  "best_val_f1":0.5871728149
+}

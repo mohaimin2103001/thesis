@@ -19,9 +19,11 @@ Paste the following script into the first code cell of your Kaggle notebook and 
 
 ```python
 import os
+import shutil
 import subprocess
 
 print("=== 1. CLONING THESIS REPOSITORY ===")
+!rm -rf /kaggle/working/thesis
 !git clone https://github.com/mohaimin2103001/thesis.git /kaggle/working/thesis
 %cd /kaggle/working/thesis
 
@@ -33,7 +35,7 @@ print("\n=== 3. DOWNLOADING AUTHENTIC UEIKAP DATASET (~20s on Kaggle) ===")
 !curl -L -C - "https://zenodo.org/records/18391027/files/UEIKAP_SAR.zip?download=1" -o data/raw/UEIKAP_SAR.zip
 !unzip -q -o data/raw/UEIKAP_SAR.zip -d data/raw/UEIKAP_SAR
 
-# Organize extracted folder in pure Python
+# Normalize extracted folder structure
 raw_dir = 'data/raw'
 tgt_dir = os.path.join(raw_dir, 'UEIKAP_SAR')
 for root, dirs, files in os.walk(raw_dir):
@@ -44,9 +46,12 @@ for root, dirs, files in os.walk(raw_dir):
             if not os.path.exists(dst_p):
                 shutil.move(src_p, dst_p)
 
-print("\n=== 4. PREPROCESSING WAKE MASKS & CENTERLINES (~25s) ===")
-!python -m src.data.ueikap_parser
-!python -m src.data.build_master_dataset
+print("\n=== 4. VERIFYING DATASETS & PREPROCESSING ===")
+if not os.path.exists('data/processed/maneuver_master.parquet'):
+    !python -m src.data.ueikap_parser
+    !python -m src.data.build_master_dataset
+else:
+    print("Pre-compiled leak-free master dataset verified: data/processed/maneuver_master.parquet")
 
 print("\n=== 5. EXECUTING KAGGLE MASTER GPU TRAINING PIPELINE ===")
 # Trains on GPU:

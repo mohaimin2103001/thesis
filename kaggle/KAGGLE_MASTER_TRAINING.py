@@ -40,17 +40,25 @@ GEOMETRY_COLS = [
 ]
 
 
+_PATH_CACHE = {}
+
 def resolve_path(p):
     if not p or not isinstance(p, str):
         return p
+    if p in _PATH_CACHE:
+        return _PATH_CACHE[p]
     if os.path.exists(p):
+        _PATH_CACHE[p] = p
         return p
     fname = os.path.basename(p.replace("\\", "/"))
-    for base in ["data/raw/UEIKAP_SAR/images", "data/interim/ueikap_masks", "data/raw", "data/interim"]:
+    for base in ["data/raw/UEIKAP_SAR/images", "data/interim/ueikap_masks", "data/raw", "data/interim", "data/processed"]:
         if os.path.exists(base):
             for root, _, files in os.walk(base):
                 if fname in files:
-                    return os.path.join(root, fname)
+                    found = os.path.join(root, fname)
+                    _PATH_CACHE[p] = found
+                    return found
+    _PATH_CACHE[p] = p
     return p
 
 

@@ -1,0 +1,17 @@
+{
+  "total_annotations": 531,
+  "categories": [
+    "wake"
+  ],
+  "annotation_types": [
+    "polygon"
+  ],
+  "image_shapes": [
+    [
+      512,
+      512
+    ]
+  ],
+  "avg_polygons_per_sample": 1.11864406779661,
+  "max_polygons_per_sample": 4
+}

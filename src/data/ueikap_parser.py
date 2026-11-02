@@ -13,11 +13,12 @@ import pandas as pd
 from PIL import Image, ImageDraw
 import cv2
 
-RAW_DIR = r"e:\thesis\data\raw\UEIKAP_SAR"
-INTERIM_MASKS_DIR = r"e:\thesis\data\interim\ueikap_masks"
-FIGURES_DIR = r"e:\thesis\figures\ueikap_mask_qa"
-PROCESSED_DIR = r"e:\thesis\data\processed"
-REJECTED_DIR = r"e:\thesis\data\rejected"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+RAW_DIR = os.path.join(PROJECT_ROOT, "data", "raw", "UEIKAP_SAR")
+INTERIM_MASKS_DIR = os.path.join(PROJECT_ROOT, "data", "interim", "ueikap_masks")
+FIGURES_DIR = os.path.join(PROJECT_ROOT, "figures", "ueikap_mask_qa")
+PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
+REJECTED_DIR = os.path.join(PROJECT_ROOT, "data", "rejected")
 
 
 def normalize_key(filename):

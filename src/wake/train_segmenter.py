@@ -14,9 +14,10 @@ from torch.utils.data import Dataset, DataLoader
 import cv2
 import segmentation_models_pytorch as smp
 
-CHECKPOINTS_DIR = r"e:\thesis\checkpoints\segmenter"
-PACKAGE_DIR = r"e:\thesis\data\processed\wake_segmentation_kaggle"
-LOGS_DIR = r"e:\thesis\logs"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+CHECKPOINTS_DIR = os.path.join(PROJECT_ROOT, "checkpoints", "segmenter")
+PACKAGE_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "wake_segmentation_kaggle")
+LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 
 
 class WakeDataset(Dataset):

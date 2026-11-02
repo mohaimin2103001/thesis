@@ -10,7 +10,8 @@ import shutil
 import pandas as pd
 import numpy as np
 
-PROCESSED_DIR = r"e:\thesis\data\processed"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
 KAGGLE_PKG_DIR = os.path.join(PROCESSED_DIR, "wake_segmentation_kaggle")
 
 

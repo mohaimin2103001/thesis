@@ -19,11 +19,12 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import f1_score, balanced_accuracy_score, confusion_matrix, mean_absolute_error, mean_squared_error, r2_score
 
-PROCESSED_DIR = r"e:\thesis\data\processed"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
 SPLITS_DIR = os.path.join(PROCESSED_DIR, "splits")
-FIGURES_DIR = r"e:\thesis\figures"
-TABLES_DIR = r"e:\thesis\tables"
-CHECKPOINTS_DIR = r"e:\thesis\checkpoints"
+FIGURES_DIR = os.path.join(PROJECT_ROOT, "figures")
+TABLES_DIR = os.path.join(PROJECT_ROOT, "tables")
+CHECKPOINTS_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
 
 os.makedirs(FIGURES_DIR, exist_ok=True)
 os.makedirs(TABLES_DIR, exist_ok=True)

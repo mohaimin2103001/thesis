@@ -12,12 +12,19 @@ import numpy as np
 from PIL import Image
 
 import sys
-sys.path.append(r"e:\thesis\src")
-from geometry.wake_geometry import extract_wake_features_from_mask
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+SRC_DIR = os.path.join(PROJECT_ROOT, "src")
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
 
-PROCESSED_DIR = r"e:\thesis\data\processed"
+try:
+    from geometry.wake_geometry import extract_wake_features_from_mask
+except ImportError:
+    from src.geometry.wake_geometry import extract_wake_features_from_mask
+
+PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
 SPLITS_DIR = os.path.join(PROCESSED_DIR, "splits")
-REJECTED_DIR = r"e:\thesis\data\rejected"
+REJECTED_DIR = os.path.join(PROJECT_ROOT, "data", "rejected")
 
 
 def parse_ueikap_ais_telemetry(ais_path):

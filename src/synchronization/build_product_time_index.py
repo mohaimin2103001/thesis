@@ -7,8 +7,9 @@ Normalizes timestamps to UTC and saves mmdec_product_time_index.parquet.
 import os
 import pandas as pd
 
-SAT_DIR = r"e:\thesis\data\raw\mmdec\Dataset_S1_SatShipAI_outputs\Dataset_S1_SatShipAI_outputs"
-PROCESSED_DIR = r"e:\thesis\data\processed"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+SAT_DIR = os.path.join(PROJECT_ROOT, "data", "raw", "mmdec", "Dataset_S1_SatShipAI_outputs", "Dataset_S1_SatShipAI_outputs")
+PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
 
 
 def build_product_time_index():

@@ -12,9 +12,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 
-PROCESSED_DIR = r"e:\thesis\data\processed"
-FIGURES_DIR = r"e:\thesis\figures"
-TABLES_DIR = r"e:\thesis\tables"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
+FIGURES_DIR = os.path.join(PROJECT_ROOT, "figures")
+TABLES_DIR = os.path.join(PROJECT_ROOT, "tables")
 
 os.makedirs(FIGURES_DIR, exist_ok=True)
 os.makedirs(TABLES_DIR, exist_ok=True)
