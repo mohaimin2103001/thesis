@@ -1,6 +1,6 @@
-Model,State_F1,State_BalAcc,Dir_F1,ROT_MAE,ROT_R2
-Full SAR Image-Only,0.742,0.685,0.582,2.14,0.31
-Segmented Wake-Only,0.778,0.71,0.634,1.82,0.44
-Wake Geometry-Only (MLP),0.761,0.694,0.715,1.65,0.52
-Visual-Geometry Fusion,0.834,0.782,0.812,1.28,0.67
-Fusion + Physics Guidance,0.856,0.814,0.849,1.12,0.74
+Model,State_Acc,State_BalAcc,State_MacroF1,State_Precision,State_Recall,State_ROC_AUC,Dir_Acc,Dir_MacroF1,ROT_MAE,ROT_RMSE,ROT_Pearson_r,ROT_R2,ROT_SignConsistency
+Model 1: Raw SAR Image-Only,0.809,0.5379,0.5411,0.2222,0.1667,0.5476,0.5,0.4375,0.805,1.839,0.031,-0.031,0.417
+Model 2: Segmented Wake-Only,0.8427,0.487,0.4573,0.0,0.0,0.4275,0.5833,0.5804,0.71,1.857,-0.12,-0.052,0.167
+Model 3: Wake Geometry-Only (MLP),0.7753,0.4481,0.4367,0.0,0.0,0.4556,0.4167,0.4126,0.575,1.834,-0.071,-0.026,0.25
+Model 4: Visual-Geometry Fusion,0.7753,0.4832,0.4814,0.1,0.0833,0.4978,0.25,0.2,0.853,1.898,-0.11,-0.099,0.333
+Model 5: Fusion + Physics Guidance (Ours),0.8652,0.5,0.4639,0.0,0.0,0.592,0.5,0.4375,0.677,1.846,-0.011,-0.039,0.5

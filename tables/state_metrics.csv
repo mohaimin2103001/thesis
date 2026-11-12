@@ -1,0 +1,6 @@
+Model,State_Acc,State_BalAcc,State_Precision,State_Recall,State_MacroF1,State_ROC_AUC
+Model 1: Raw SAR Image-Only,0.809,0.5379,0.2222,0.1667,0.5411,0.5476
+Model 2: Segmented Wake-Only,0.8427,0.487,0.0,0.0,0.4573,0.4275
+Model 3: Wake Geometry-Only (MLP),0.7753,0.4481,0.0,0.0,0.4367,0.4556
+Model 4: Visual-Geometry Fusion,0.7753,0.4832,0.1,0.0833,0.4814,0.4978
+Model 5: Fusion + Physics Guidance (Ours),0.8652,0.5,0.0,0.0,0.4639,0.592
