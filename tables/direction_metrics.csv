@@ -1,6 +1,6 @@
 Model,Dir_Acc,Dir_MacroF1
-Model 1: Raw SAR Image-Only,0.5,0.4375
-Model 2: Segmented Wake-Only,0.5833,0.5804
-Model 3: Wake Geometry-Only (MLP),0.4167,0.4126
-Model 4: Visual-Geometry Fusion,0.25,0.2
-Model 5: Fusion + Physics Guidance (Ours),0.5,0.4375
+Model 1: Raw SAR Image-Only,0.4167,0.2941
+Model 2: Segmented Wake-Only,0.1667,0.1429
+Model 3: Wake Geometry-Only (MLP),0.4167,0.2941
+Model 4: Visual-Geometry Fusion,0.5833,0.4958
+Model 5: Fusion + Physics Guidance (Ours),0.4167,0.2941
