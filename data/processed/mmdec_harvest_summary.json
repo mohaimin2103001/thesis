@@ -1,0 +1,21 @@
+{
+  "total_satellite_products": 230,
+  "total_detections_scanned": 13306,
+  "qualified_commercial_candidates": 8312,
+  "target_straight_ships": 1000,
+  "target_turning_ships": 750,
+  "splits": {
+    "train_vessels": 5344,
+    "val_vessels": 1710,
+    "test_vessels": 1258
+  },
+  "ship_classes": {
+    "Tanker": 3509,
+    "Cargo": 3470,
+    "Other": 769,
+    "Passenger": 559,
+    "Fishing": 5
+  },
+  "mean_ship_length_m": 153.4296198267565,
+  "output_manifest": "E:\\thesis\\data\\processed\\mmdec_harvest_manifest.parquet"
+}
