@@ -45,36 +45,12 @@ print("=== 3. DOWNLOADING UEIKAP + MMDEC DATASETS IN KAGGLE CLOUD ===")
 print("=" * 80)
 !mkdir -p data/raw/mmdec data/processed data/interim checkpoints outputs tables figures logs
 
-# A. UEIKAP Benchmark (~100 MB)
-if not os.path.exists('data/raw/UEIKAP_SAR.zip'):
-    !curl -L -C - "https://zenodo.org/records/18391027/files/UEIKAP_SAR.zip?download=1" -o data/raw/UEIKAP_SAR.zip
-    !unzip -q -o data/raw/UEIKAP_SAR.zip -d data/raw/UEIKAP_SAR
+!python -m src.data.kaggle_download_helper
 
-raw_dir = 'data/raw'
-tgt_dir = os.path.join(raw_dir, 'UEIKAP_SAR')
-for root, dirs, files in os.walk(raw_dir):
-    if 'images' in dirs and root != tgt_dir:
-        for d in dirs:
-            src_p = os.path.join(root, d)
-            dst_p = os.path.join(tgt_dir, d)
-            if not os.path.exists(dst_p):
-                shutil.move(src_p, dst_p)
-
-!python -m src.data.ueikap_parser
-!python -m src.data.build_master_dataset
-!python -m src.wake.package_segmentation_data
-
-# B. MMDEC AIS (430 MB) + Corners (5 MB) + SAR Chunks Zip (10.5 GB - streamed directly!)
-mmdec_dir = 'data/raw/mmdec'
-if not os.path.exists(f'{mmdec_dir}/Dataset_AIS_POS.parquet'):
-    !curl -L -C - "https://zenodo.org/api/records/17491518/files/Dataset_AIS_POS.parquet/content" -o {mmdec_dir}/Dataset_AIS_POS.parquet
-
-if not os.path.exists(f'{mmdec_dir}/Dataset_S1_chunks_corners.zip'):
-    !curl -L -C - "https://zenodo.org/api/records/17491518/files/Dataset_S1_chunks_corners.zip/content" -o {mmdec_dir}/Dataset_S1_chunks_corners.zip
-
-if not os.path.exists(f'{mmdec_dir}/Dataset_S1_chunks.zip'):
-    print("Downloading MMDEC Dataset_S1_chunks.zip (~10.5 GB, streamed from zip without unzipping)...")
-    !curl -L -C - "https://zenodo.org/api/records/17491518/files/Dataset_S1_chunks.zip/content" -o {mmdec_dir}/Dataset_S1_chunks.zip
+if not os.path.exists('data/processed/wake_segmentation_kaggle/images') or len(os.listdir('data/processed/wake_segmentation_kaggle/images')) == 0:
+    !python -m src.data.ueikap_parser
+    !python -m src.data.build_master_dataset
+    !python -m src.wake.package_segmentation_data
 
 print("\n" + "=" * 80)
 print("=== 4. STAGE 1: TRAINING HYBRID WAKE-NET (ResNet-50 + scSE + Radon) ===")
