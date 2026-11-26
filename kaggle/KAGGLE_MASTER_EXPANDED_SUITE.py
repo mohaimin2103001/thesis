@@ -331,10 +331,10 @@ def evaluate_predictions(state_probs, dir_probs, rot_preds, state_true, dir_true
     }
 
 
-def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=4):
+def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=-1):
     """
     Generates comparative Raw SAR vs 7x7 Lee-Filtered ConvNeXt Grad-CAM visualizations
-    across Straight, Port, and Starboard test vessels, overlays wake mask contours,
+    across ALL test vessels (when num_per_class=-1) or balanced subsets, overlays wake mask contours,
     and quantifies Inside-Wake Attention Concentration in tables/convnext_gradcam_analysis.csv.
     """
     convnext_net.eval()
@@ -351,12 +351,15 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=4)
     h1 = target_layer.register_forward_hook(fwd_hook)
     h2 = target_layer.register_full_backward_hook(bwd_hook)
 
-    # Balanced selection across Straight (0), Port (1), Starboard (2)
-    selected_indices = []
-    for cls_id in (0, 1, 2):
-        cls_idxs = [i for i in range(len(test_ds)) if test_ds.dir_labels[i] == cls_id][:num_per_class]
-        selected_indices.extend(cls_idxs)
+    if num_per_class <= 0:
+        selected_indices = list(range(len(test_ds)))
+    else:
+        selected_indices = []
+        for cls_id in (0, 1, 2):
+            cls_idxs = [i for i in range(len(test_ds)) if test_ds.dir_labels[i] == cls_id][:num_per_class]
+            selected_indices.extend(cls_idxs)
 
+    print(f"[GRAD-CAM] Generating Raw vs 7x7 Lee Grad-CAM heatmaps for all {len(selected_indices)} test images...")
     audit_rows = []
     for k, idx in enumerate(selected_indices):
         activations.clear()
@@ -371,7 +374,7 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=4)
         st_logit, dir_logits, rot_pred = convnext_net(x_img, x_phys)
         convnext_net.zero_grad()
 
-        # Target predicted directional class (or turning class for maneuver saliency)
+        # Target predicted directional class (or binary maneuver score when straight)
         pred_cls = int(torch.argmax(dir_logits, dim=1).item())
         score = dir_logits[0, pred_cls] if pred_cls != 0 else st_logit[0]
         score.backward()
@@ -393,8 +396,9 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=4)
             if m_img is not None:
                 m_res = cv2.resize(m_img, (256, 256), interpolation=cv2.INTER_NEAREST)
                 mask_bin = m_res > 127
-                total_e = float(np.sum(cam_res)) + 1e-8
-                wake_energy_ratio = float(np.sum(cam_res[mask_bin]) / total_e)
+                if np.any(mask_bin):
+                    total_e = float(np.sum(cam_res)) + 1e-8
+                    wake_energy_ratio = float(np.sum(cam_res[mask_bin]) / total_e)
 
         raw_np = img_t.squeeze().numpy()
         fig, axes = plt.subplots(1, 3, figsize=(12, 4))
@@ -404,18 +408,20 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=4)
         axes[1].set_title("7x7 Lee Speckle Filtered")
         axes[2].imshow(lee_img, cmap="gray")
         axes[2].imshow(cam_res, cmap="jet", alpha=0.45)
-        if mask_bin is not None:
+        if mask_bin is not None and np.any(mask_bin):
             axes[2].contour(mask_bin.astype(float), levels=[0.5], colors="white", linewidths=1.2)
         dir_str = row.get("direction", "None")
         axes[2].set_title(f"Grad-CAM | GT:{row.get('state')}/{dir_str} | ROT:{rot_true:.1f}")
         for ax in axes:
             ax.axis("off")
         plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f"convnext_gradcam_{k+1}.png"), dpi=150)
+        sid_safe = str(row.get("sample_id", f"idx_{idx}")).replace("/", "_").replace("\\", "_")
+        plt.savefig(os.path.join(out_dir, f"convnext_gradcam_{k+1:04d}_{sid_safe}.png"), dpi=110)
         plt.close(fig)
 
         audit_rows.append({
             "sample_id": row.get("sample_id", f"idx_{idx}"),
+            "source_dataset": row.get("source_dataset", "SAR"),
             "state_true": row.get("state", "Unknown"),
             "direction_true": dir_str,
             "rot_true": float(rot_true),
@@ -554,7 +560,7 @@ def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base
     return imp_df
 
 
-def run_master_suite(epochs=25, batch_size=32, lr=2e-4):
+def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     # 1. Load Expanded MMDEC+UEIKAP Dataset if present, else UEIKAP master
     expanded_path = os.path.join(DATA_DIR, "processed", "master_expanded_mmdec.parquet")
     ueikap_path = os.path.join(DATA_DIR, "processed", "maneuver_master.parquet")
@@ -811,9 +817,9 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4):
     pred_out["pred_rot_deg_min"] = t_rot_p
     pred_out.to_parquet(os.path.join(DATA_DIR, "processed", "expanded_test_predictions.parquet"), index=False)
 
-    # Generate Before-vs-After Lee Filter Grad-CAM + Wake Overlap Audit across Straight/Port/Starboard
+    # Generate Before-vs-After Lee Filter Grad-CAM + Wake Overlap Audit across ALL test images (-1)
     try:
-        generate_lee_vs_raw_gradcam(convnext_net, test_ds, GRADCAM_DIR, num_per_class=4)
+        generate_lee_vs_raw_gradcam(convnext_net, test_ds, GRADCAM_DIR, num_per_class=gradcam_per_class)
         print(f"[GRAD-CAM] Saved comparative visualizations & wake overlap CSV in {GRADCAM_DIR} and {TABLES_DIR}")
     except Exception as e:
         print(f"[WARNING] Grad-CAM visualization skipped: {e}")
@@ -826,5 +832,6 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--gradcam_per_class", type=int, default=-1, help="-1 generates Grad-CAM for ALL test images")
     args = parser.parse_args()
-    run_master_suite(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+    run_master_suite(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, gradcam_per_class=args.gradcam_per_class)
