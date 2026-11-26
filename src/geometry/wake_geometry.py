@@ -27,7 +27,8 @@ def clean_wake_mask(binary_mask, min_size=50, hole_size=100):
 
 def extract_ordered_centerline(cleaned_mask, ship_point=None):
     """
-    Skeletonizes cleaned binary mask and extracts an ordered list of points from ship towards wake tail.
+    Skeletonizes cleaned binary mask, counts true skeleton junction branches,
+    and extracts an ordered chain from the ship end toward the wake tail.
     """
     bool_mask = cleaned_mask > 127
     skeleton = skeletonize(bool_mask)
@@ -36,28 +37,31 @@ def extract_ordered_centerline(cleaned_mask, ship_point=None):
     if len(x_coords) < 10:
         return None, 0, 0.0
 
+    # Count 8-connected branch/junction pixels (>2 neighbors on skeleton)
+    sk_u8 = skeleton.astype(np.uint8)
+    nbrs = cv2.filter2D(sk_u8, -1, np.ones((3, 3), dtype=np.uint8)) - sk_u8
+    branch_count = int(np.sum((sk_u8 == 1) & (nbrs >= 3)))
+
     pts = np.column_stack([x_coords, y_coords])
 
-    # If ship_point (x, y) is not provided, estimate ship end as the densest extremity
-    if ship_point is None:
-        # Distance transform to find thickest wake region (near vessel hull)
-        dist_map = distance_transform_edt(bool_mask)
-        dists = [dist_map[int(y), int(x)] for x, y in pts]
-        ship_idx = int(np.argmax(dists))
-        start_pt = pts[ship_idx]
-    else:
-        # Find closest skeleton point to ship coordinates
-        dists = np.hypot(pts[:, 0] - ship_point[0], pts[:, 1] - ship_point[1])
-        ship_idx = int(np.argmin(dists))
-        start_pt = pts[ship_idx]
+    # Identify skeleton endpoints (1 neighbor) or dense origin
+    end_idx = np.where((sk_u8 == 1) & (nbrs == 1))
+    end_pts = np.column_stack([end_idx[1], end_idx[0]]) if len(end_idx[0]) > 0 else pts
 
-    # Greedy chain tracing from ship point to wake tail
+    if ship_point is None:
+        h, w = cleaned_mask.shape
+        ship_point = (w * 0.5, h * 0.5)
+
+    # Start from the skeleton point closest to the ship center
+    dists = np.hypot(pts[:, 0] - ship_point[0], pts[:, 1] - ship_point[1])
+    ship_idx = int(np.argmin(dists))
+    start_pt = pts[ship_idx]
+
+    # Greedy chain tracing with gap tolerance up to 15 px
     remaining = set(range(len(pts)))
     ordered = [start_pt]
     remaining.remove(ship_idx)
     curr_pt = start_pt
-
-    branch_count = 0
 
     while remaining:
         rem_indices = list(remaining)
@@ -66,8 +70,7 @@ def extract_ordered_centerline(cleaned_mask, ship_point=None):
         min_idx_in_rem = int(np.argmin(dist_to_curr))
         min_dist = dist_to_curr[min_idx_in_rem]
 
-        # Connected neighborhood step threshold (max 5 pixels jump)
-        if min_dist > 5.0:
+        if min_dist > 15.0:
             break
 
         nearest_orig_idx = rem_indices[min_idx_in_rem]
@@ -79,7 +82,6 @@ def extract_ordered_centerline(cleaned_mask, ship_point=None):
     if len(ordered_pts) < 10:
         return None, branch_count, 0.0
 
-    # Confidence score based on chain length vs total skeleton points
     confidence = min(1.0, len(ordered_pts) / float(len(pts)))
     return ordered_pts, branch_count, confidence
 

@@ -58,6 +58,107 @@ def parse_id_chunk(val):
     return s if s and s.lower() != "nan" and s.lower() != "none" else None
 
 
+def load_satshipai_index(mmdec_dir, min_det_prob=0.35, min_ship_len=30.0):
+    """
+    Loads SatShipAI radar ship detections (lon, lat, X, Y, detection_prob, ship_length)
+    per Sentinel-1 product from extracted folder or Dataset_S1_SatShipAI_outputs.zip.
+    Filtering to radar-confirmed ships eliminates coastal clutter and Doppler-misaligned
+    empty-water crops, pinning crops accurately on true SAR vessels.
+    """
+    sat_map = {}
+    extracted_root = os.path.join(mmdec_dir, "Dataset_S1_SatShipAI_outputs")
+    zip_path = os.path.join(mmdec_dir, "Dataset_S1_SatShipAI_outputs.zip")
+
+    def _keep(df):
+        if df is None or len(df) == 0:
+            return None
+        mask = (df["detection_prob"] >= min_det_prob) & (df["ship_length"] >= min_ship_len)
+        sub = df[mask].reset_index(drop=True)
+        return sub if len(sub) > 0 else None
+
+    if os.path.exists(extracted_root):
+        for root, _, files in os.walk(extracted_root):
+            if "__MACOSX" in root:
+                continue
+            for f in files:
+                if f.endswith(".csv") and not f.startswith("._") and f != "extra_info.csv":
+                    prod = f.replace(".csv", "")
+                    sub = _keep(pd.read_csv(os.path.join(root, f)))
+                    if sub is not None:
+                        sat_map[prod] = sub
+    elif os.path.exists(zip_path):
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for name in zf.namelist():
+                base = os.path.basename(name)
+                if base.endswith(".csv") and not name.startswith("__MACOSX") and not base.startswith("._") and base != "extra_info.csv":
+                    prod = base.replace(".csv", "")
+                    with zf.open(name) as f:
+                        sub = _keep(pd.read_csv(f))
+                        if sub is not None:
+                            sat_map[prod] = sub
+    return sat_map
+
+
+def match_ais_to_satshipai(cand_df, sat_map, max_dist_m=1200.0, stride=750):
+    """
+    Matches AIS trajectories 1-to-1 to nearest unambiguous open-water SatShipAI radar detections
+    within max_dist_m (accounting for Sentinel-1 range-velocity azimuth Doppler shift).
+    Updates chunk_name and chunk-local (sat_x, sat_y) from true radar pixel (X, Y) using stride=750.
+    """
+    if not sat_map:
+        print("[MMDEC SATSHIPAI] SatShipAI outputs not found — falling back to raw AIS homography.")
+        cand_df = cand_df.copy()
+        cand_df["sat_dist_m"] = np.nan
+        cand_df["sat_matched"] = False
+        cand_df["sat_x"] = np.nan
+        cand_df["sat_y"] = np.nan
+        return cand_df
+
+    matches = []
+    for idx, row in cand_df.iterrows():
+        det_df = sat_map.get(row["product_id"])
+        if det_df is None or len(det_df) == 0:
+            continue
+        lat0 = np.deg2rad(float(row["latitude"]))
+        dy = (det_df["lat"].values - float(row["latitude"])) * 111320.0
+        dx = (det_df["lon"].values - float(row["longitude"])) * 111320.0 * np.cos(lat0)
+        dists = np.hypot(dx, dy)
+        best_i = int(np.argmin(dists))
+        best_d = float(dists[best_i])
+        if best_d <= max_dist_m:
+            rx = float(det_df["X"].iloc[best_i])
+            ry = float(det_df["Y"].iloc[best_i])
+            ci = int(rx // stride)
+            cj = int(ry // stride)
+            matches.append((idx, best_d, (row["product_id"], best_i), f"i{ci}j{cj}", rx - ci * stride, ry - cj * stride,
+                            float(det_df["ship_length"].iloc[best_i]), float(det_df["detection_prob"].iloc[best_i])))
+
+    # Enforce 1-to-1 matching: keep closest AIS ping if two trajectories contend for the same radar return
+    best_by_det = {}
+    for item in matches:
+        det_key = item[2]
+        if det_key not in best_by_det or item[1] < best_by_det[det_key][1]:
+            best_by_det[det_key] = item
+
+    kept_rows = []
+    for item in best_by_det.values():
+        idx, best_d, _, true_chunk, sx, sy, slen, sprob = item
+        rec = cand_df.loc[idx].to_dict()
+        rec["chunk_name"] = true_chunk
+        rec["sat_dist_m"] = best_d
+        rec["sat_matched"] = True
+        rec["sat_x"] = sx
+        rec["sat_y"] = sy
+        rec["ship_length_sar"] = slen
+        rec["sat_det_prob"] = sprob
+        kept_rows.append(rec)
+
+    matched_df = pd.DataFrame(kept_rows).reset_index(drop=True)
+    print(f"[MMDEC SATSHIPAI] Confirmed 1-to-1 radar matches (<= {max_dist_m:.0f}m, len>=30m): "
+          f"{len(matched_df):,} / {len(cand_df):,} AIS trajectories.")
+    return matched_df
+
+
 def load_corners_index(mmdec_dir):
     """Loads chunk corner lat/lon tables from either extracted folder or zip archive."""
     corners_map = {}
@@ -190,7 +291,7 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=600):
             else:
                 continue
 
-        if abs(rot_deg_min) > 100.0:
+        if abs(rot_deg_min) > 25.0:
             continue
 
         records.append({
@@ -230,10 +331,11 @@ def build_zip_lookup(chunks_zip_path):
     return lookup
 
 
-def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop_size=512, chunk_size=800):
+def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop_size=512, chunk_size=800, stride=750):
     """
-    Reads the target chunk and any needed 3x3 neighbor chunks directly from Dataset_S1_chunks.zip,
-    extracting a 512x512 crop centered on the ship without extracting the 10.5 GB zip file!
+    Reads the target chunk and any needed 3x3 neighbor chunks directly from Dataset_S1_chunks.zip
+    without unzipping the 10.5 GB archive. Uses MMDEC's true 750 px chunk stride (50 px overlap) and
+    correct axis convention: X = ci * 750 + local_x, Y = cj * 750 + local_y.
     """
     m = re.match(r"i(-?\d+)j(-?\d+)", chunk_name)
     if not m:
@@ -241,7 +343,7 @@ def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop
     ci, cj = int(m.group(1)), int(m.group(2))
     half = crop_size // 2
 
-    # Fast path if ship is comfortably inside the single 800x800 chunk
+    # Fast single-chunk path when crop stays strictly inside target chunk
     if half <= ship_x <= (chunk_size - half) and half <= ship_y <= (chunk_size - half):
         zname = zip_lookup.get((prod, chunk_name))
         if not zname:
@@ -250,27 +352,37 @@ def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop
         img = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if img is None:
             return None
+        ih, iw = img.shape[:2]
         cx, cy = int(round(ship_x)), int(round(ship_y))
-        crop = img[cy - half:cy + half, cx - half:cx + half]
-        return crop if crop.shape[:2] == (crop_size, crop_size) else None
+        if cx - half >= 0 and cy - half >= 0 and cx + half <= iw and cy + half <= ih:
+            crop = img[cy - half:cy + half, cx - half:cx + half]
+            return crop if crop.shape[:2] == (crop_size, crop_size) else None
 
-    # Neighbor stitching path (3x3 grid -> 2400x2400 canvas)
-    canvas = np.zeros((chunk_size * 3, chunk_size * 3, 3), dtype=np.uint8)
-    for di in (-1, 0, 1):
-        for dj in (-1, 0, 1):
-            zname = zip_lookup.get((prod, f"i{ci+di}j{cj+dj}"))
-            if zname:
-                data = np.frombuffer(zf.read(zname), np.uint8)
-                patch = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                if patch is not None:
-                    ph, pw = patch.shape[:2]
-                    y0 = (di + 1) * chunk_size
-                    x0 = (dj + 1) * chunk_size
-                    canvas[y0:y0 + min(ph, chunk_size), x0:x0 + min(pw, chunk_size)] = patch[:chunk_size, :chunk_size]
+    # Seam-free 3x3 neighbor stitching canvas using stride=750 and (ci=X, cj=Y)
+    # Paint outer neighbors first and the primary chunk (0, 0) last so the center overlap is exact.
+    canvas_dim = stride * 2 + chunk_size  # 2300x2300 for 3x3 grid with 50px overlap
+    canvas = np.zeros((canvas_dim, canvas_dim, 3), dtype=np.uint8)
+    offsets = [
+        (di, dj) for di in (-1, 0, 1) for dj in (-1, 0, 1) if not (di == 0 and dj == 0)
+    ] + [(0, 0)]
 
-    cx = int(round(chunk_size + ship_x))
-    cy = int(round(chunk_size + ship_y))
-    if cx - half < 0 or cy - half < 0 or cx + half > chunk_size * 3 or cy + half > chunk_size * 3:
+    for di, dj in offsets:
+        zname = zip_lookup.get((prod, f"i{ci + di}j{cj + dj}"))
+        if zname:
+            data = np.frombuffer(zf.read(zname), np.uint8)
+            patch = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if patch is not None:
+                ph, pw = patch.shape[:2]
+                x0 = (di + 1) * stride
+                y0 = (dj + 1) * stride
+                h_use = min(ph, chunk_size, canvas_dim - y0)
+                w_use = min(pw, chunk_size, canvas_dim - x0)
+                if h_use > 0 and w_use > 0:
+                    canvas[y0:y0 + h_use, x0:x0 + w_use] = patch[:h_use, :w_use]
+
+    cx = int(round(stride + ship_x))
+    cy = int(round(stride + ship_y))
+    if cx - half < 0 or cy - half < 0 or cx + half > canvas_dim or cy + half > canvas_dim:
         return None
     crop = canvas[cy - half:cy + half, cx - half:cx + half]
     return crop if crop.shape[:2] == (crop_size, crop_size) else None
@@ -278,7 +390,7 @@ def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop
 
 def run_mmdec_harvest_and_mask(
     min_sog=3.5,
-    min_turn_rot=1.5,
+    min_turn_rot=1.0,
     max_straight=4000,
     max_turning=-1,
     batch_size=32,
@@ -297,11 +409,13 @@ def run_mmdec_harvest_and_mask(
     if not os.path.exists(chunks_zip_path):
         raise FileNotFoundError(f"Missing {chunks_zip_path}")
 
-    # 1. AIS Kinematic Ground-Truth
+    # 1. AIS Kinematic Ground-Truth + SatShipAI Open-Water Radar Confirmation
     cand_df = compute_kinematic_rot_from_ais(ais_path, min_sog=min_sog)
+    sat_map = load_satshipai_index(MMDEC_DIR, min_det_prob=0.35, min_ship_len=30.0)
+    cand_df = match_ais_to_satshipai(cand_df, sat_map, max_dist_m=1200.0, stride=750)
 
     # Partition into Straight vs Turning (following exact UEIKAP maritime sign convention)
-    straight_pool = cand_df[(cand_df["rot_deg_min"].abs() < 0.5) & (cand_df["delta_cog_win"] < 3.0)].copy()
+    straight_pool = cand_df[(cand_df["rot_deg_min"].abs() < 0.45) & (cand_df["delta_cog_win"] < 2.5)].copy()
     straight_pool["state"] = "Straight"
     straight_pool["direction"] = "None"
     straight_pool["rot_target"] = 0.0
@@ -309,10 +423,10 @@ def run_mmdec_harvest_and_mask(
     turning_pool = cand_df[cand_df["rot_deg_min"].abs() >= min_turn_rot].copy()
     turning_pool["state"] = "Turning"
     turning_pool["direction"] = np.where(turning_pool["rot_deg_min"] < 0.0, "Port", "Starboard")
-    turning_pool["rot_target"] = turning_pool["rot_deg_min"]
+    turning_pool["rot_target"] = np.clip(turning_pool["rot_deg_min"], -12.0, 12.0)
 
-    print(f"\n[MMDEC HARVEST POOLS]")
-    print(f"  Available Straight (|ROT|<0.5, dCOG<3.0): {len(straight_pool):,}")
+    print(f"\n[MMDEC HARVEST POOLS (SatShipAI Verified)]")
+    print(f"  Available Straight (|ROT|<0.45, dCOG<2.5): {len(straight_pool):,}")
     print(f"  Available Turning (|ROT|>={min_turn_rot}):  {len(turning_pool):,} "
           f"(Port: {sum(turning_pool['direction']=='Port')}, Starboard: {sum(turning_pool['direction']=='Starboard')})")
 
@@ -347,23 +461,27 @@ def run_mmdec_harvest_and_mask(
         for idx, row in tqdm(selected_df.iterrows(), total=len(selected_df), desc="Cropping SAR chips from zip"):
             prod = row["product_id"]
             chunk = row["chunk_name"]
-            if prod not in corners_map or chunk not in corners_map[prod].index:
-                continue
 
-            corner_row = corners_map[prod].loc[chunk]
-            if isinstance(corner_row, pd.DataFrame):
-                corner_row = corner_row.iloc[0]
+            if bool(row.get("sat_matched", False)) and pd.notna(row.get("sat_x", np.nan)):
+                ship_x = float(row["sat_x"])
+                ship_y = float(row["sat_y"])
+            else:
+                if prod not in corners_map or chunk not in corners_map[prod].index:
+                    continue
+                corner_row = corners_map[prod].loc[chunk]
+                if isinstance(corner_row, pd.DataFrame):
+                    corner_row = corner_row.iloc[0]
+                ship_x, ship_y = latlon_to_chunk_pixel(row["latitude"], row["longitude"], corner_row)
 
-            ship_x, ship_y = latlon_to_chunk_pixel(row["latitude"], row["longitude"], corner_row)
             if not (-50 <= ship_x <= 850 and -50 <= ship_y <= 850):
                 continue
 
-            crop = extract_stitched_crop(zf, zip_lookup, prod, chunk, ship_x, ship_y, crop_size=512)
+            crop = extract_stitched_crop(zf, zip_lookup, prod, chunk, ship_x, ship_y, crop_size=512, chunk_size=800, stride=750)
             if crop is None:
                 continue
 
-            # Skip crops with mostly zero padding (> 25% black edge)
-            if np.mean(crop[:, :, 0] == 0) > 0.25:
+            # Skip crops with mostly zero padding (> 15% black edge / scene boundary)
+            if np.mean(crop[:, :, 0] == 0) > 0.15:
                 continue
 
             sample_id = f"MMDEC_{prod[-15:]}_{row['mmsi']}_{chunk}"
@@ -426,7 +544,7 @@ def run_mmdec_harvest_and_mask(
             cv2.imwrite(m_path, bin_mask)
             mask_paths.append(m_path)
 
-            radon_res = compute_radon_wake_kinematics(bin_mask, sog_knots=crop_df.iloc[row_idx]["sog"])
+            radon_res = compute_radon_wake_kinematics(bin_mask, sog_knots=crop_df.iloc[row_idx]["sog"], ship_point=(256.0, 256.0))
             radon_records.append(radon_res)
 
     crop_df["wake_mask_path"] = mask_paths
@@ -506,7 +624,8 @@ def run_mmdec_harvest_and_mask(
                 mp = os.path.join(PROJECT_ROOT, "data", "interim", "ueikap_masks", os.path.basename(mp))
             if os.path.exists(mp):
                 um = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
-                kr = compute_radon_wake_kinematics((um > 127).astype(np.uint8) * 255, sog_knots=ur.get("sog", None))
+                sp = (float(ur["ship_x"]), float(ur["ship_y"])) if pd.notna(ur.get("ship_x", np.nan)) else (256.0, 256.0)
+                kr = compute_radon_wake_kinematics((um > 127).astype(np.uint8) * 255, sog_knots=ur.get("sog", None), ship_point=sp)
                 u_angles.append(kr["dominant_angle_deg"])
                 u_defls.append(kr["angular_deflection_deg"])
                 u_rots.append(kr["estimated_rot"])
@@ -536,7 +655,7 @@ def run_mmdec_harvest_and_mask(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MMDEC Harvester + AIS ROT + Wake-Net Auto-Masker")
     parser.add_argument("--min_sog", type=float, default=3.5)
-    parser.add_argument("--min_turn_rot", type=float, default=1.5)
+    parser.add_argument("--min_turn_rot", type=float, default=1.0)
     parser.add_argument("--max_straight", type=int, default=4000, help="-1 for all available straight ships")
     parser.add_argument("--max_turning", type=int, default=-1, help="-1 for all available turning ships")
     parser.add_argument("--batch_size", type=int, default=32)

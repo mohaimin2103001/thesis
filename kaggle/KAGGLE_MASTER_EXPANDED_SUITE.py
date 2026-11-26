@@ -33,6 +33,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import timm
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 IS_KAGGLE = os.path.exists("/kaggle/working")
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -65,6 +67,40 @@ GEOMETRY_FEATURES = [
     "signed_mean_curvature", "curvature_std", "wake_asymmetry",
     "radon_deflection_deg"
 ]
+
+CHIRAL_PHYS_INDICES = [
+    PHYSICS_FEATURES.index("signed_mean_curvature"),
+    PHYSICS_FEATURES.index("wake_asymmetry"),
+    PHYSICS_FEATURES.index("radon_deflection_deg"),
+]
+
+
+def build_enriched_tabular_features(phys_raw):
+    """
+    Derives 20 pure SAR/Wake tabular features from the 12 observable geometry/Radon features
+    (ZERO AIS inputs). Handles missing/sparse wake masks cleanly via magnitude & ratio descriptors.
+    """
+    p = np.asarray(phys_raw, dtype=np.float32)
+    wake_len = p[:, 0:1]
+    mean_c = p[:, 2:3]
+    med_c = p[:, 3:4]
+    max_c = p[:, 4:5]
+    s_curv = p[:, 5:6]
+    asym = p[:, 7:8]
+    area = p[:, 8:9]
+    r_defl = p[:, 11:12]
+
+    derived = np.hstack([
+        np.abs(s_curv),
+        np.abs(asym),
+        np.abs(r_defl),
+        mean_c * wake_len,
+        wake_len / (np.sqrt(np.maximum(area, 0.0)) + 1.0),
+        max_c / (med_c + 1e-4),
+        (area >= 50.0).astype(np.float32),
+        np.sign(r_defl) * np.sqrt(np.abs(r_defl)),
+    ])
+    return np.hstack([p, derived]).astype(np.float32)
 
 _PATH_CACHE = {}
 
@@ -160,6 +196,7 @@ class ConvNeXtPhysicsNet(nn.Module):
 
         self.binary_head = nn.Linear(160, 1)
         self.direction_head = nn.Linear(160, 3)
+        self.turn_lr_head = nn.Linear(160, 1)
         self.rot_head = nn.Linear(160, 1)
 
     def forward(self, x_img, x_phys):
@@ -173,7 +210,12 @@ class ConvNeXtPhysicsNet(nn.Module):
         v_emb = self.backbone(x_3ch)
         p_emb = self.physics_mlp(x_phys)
         feat = self.shared_head(torch.cat([v_emb, p_emb], dim=1))
-        return self.binary_head(feat).squeeze(1), self.direction_head(feat), self.rot_head(feat).squeeze(1)
+        return (
+            self.binary_head(feat).squeeze(1),
+            self.direction_head(feat),
+            self.rot_head(feat).squeeze(1),
+            self.turn_lr_head(feat).squeeze(1),
+        )
 
 
 class GeometrySpecialistMLP(nn.Module):
@@ -193,17 +235,18 @@ class GeometrySpecialistMLP(nn.Module):
         )
         self.binary_head = nn.Linear(32, 1)
         self.direction_head = nn.Linear(32, 3)
+        self.turn_lr_head = nn.Linear(32, 1)
 
     def forward(self, x_geom):
         h = self.net(x_geom)
-        return self.binary_head(h).squeeze(1), self.direction_head(h)
+        return self.binary_head(h).squeeze(1), self.direction_head(h), self.turn_lr_head(h).squeeze(1)
 
 
 # --------------------------------------------------------------------------------------------------
 # Multimodal Dataset with Train-Only Normalization (Zero Leakage)
 # --------------------------------------------------------------------------------------------------
 class ScaledManeuverDataset(Dataset):
-    def __init__(self, df, phys_mean=None, phys_std=None, img_size=(256, 256), augment=False):
+    def __init__(self, df, phys_mean=None, phys_std=None, img_size=(384, 384), augment=False, rot_clip=12.0):
         self.df = df.reset_index(drop=True)
         self.img_size = img_size
         self.augment = augment
@@ -240,7 +283,8 @@ class ScaledManeuverDataset(Dataset):
             self.dir_labels = np.where(np.abs(rot_vals) < 0.5, 0, np.where(rot_vals < 0, 1, 2))
 
         rot_col = "rot_target" if "rot_target" in self.df.columns else ("rot_deg_min" if "rot_deg_min" in self.df.columns else "rot")
-        self.rot_values = self.df.get(rot_col, pd.Series(np.zeros(len(self.df)))).fillna(0.0).values.astype(np.float32)
+        raw_rot = self.df.get(rot_col, pd.Series(np.zeros(len(self.df)))).fillna(0.0).values.astype(np.float32)
+        self.rot_values = np.clip(raw_rot, -float(rot_clip), float(rot_clip))
 
     def __len__(self):
         return len(self.df)
@@ -299,32 +343,51 @@ class ScaledManeuverDataset(Dataset):
 
 
 # --------------------------------------------------------------------------------------------------
-# Physics-Informed Multi-Task Loss
+# Physics-Informed Multi-Task Loss & Hierarchical Chiral Inference
 # --------------------------------------------------------------------------------------------------
 class PhysicsInformedMultiTaskLoss(nn.Module):
-    def __init__(self, pos_weight=2.0, dir_weights=None, lambda_dir=0.45, lambda_rot=0.45, lambda_phys=0.05):
+    def __init__(self, pos_weight=1.25, dir_weights=None, lambda_dir=0.55, lambda_lr=0.55, lambda_rot=0.25, lambda_phys=0.10):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=DEVICE))
         if dir_weights is not None:
             self.ce_dir = nn.CrossEntropyLoss(weight=torch.tensor(dir_weights, dtype=torch.float32, device=DEVICE), label_smoothing=0.05)
         else:
             self.ce_dir = nn.CrossEntropyLoss(label_smoothing=0.05)
+        self.bce_lr = nn.BCEWithLogitsLoss()
         self.lambda_dir = lambda_dir
+        self.lambda_lr = lambda_lr
         self.lambda_rot = lambda_rot
         self.lambda_phys = lambda_phys
 
-    def forward(self, state_logit, dir_logits, rot_pred, state_t, dir_t, rot_t, signed_curv):
+    def forward(self, state_logit, dir_logits, rot_pred, lr_logit, state_t, dir_t, rot_t):
         l_state = self.bce(state_logit, state_t)
         l_dir = self.ce_dir(dir_logits, dir_t)
-        # Weight turning vessels 3x in signed ROT regression so turning magnitude is learned cleanly
-        rot_weights = 1.0 + 3.0 * state_t
-        l_rot = torch.mean(rot_weights * F.smooth_l1_loss(rot_pred, rot_t, reduction="none", beta=1.0))
-        # Light sign-coherence constraint on turning vessels
-        l_phys = torch.mean(state_t * torch.relu(-rot_pred * torch.sign(rot_t)))
-        return l_state + self.lambda_dir * l_dir + self.lambda_rot * l_rot + self.lambda_phys * l_phys
+
+        # Dedicated Port (0) vs Starboard (1) loss strictly on true Turning vessels (avoids class-0 interference)
+        turn_mask = state_t > 0.5
+        if torch.any(turn_mask):
+            lr_target = (dir_t[turn_mask] == 2).float() * 0.90 + 0.05  # label smoothing 0.05
+            l_lr = self.bce_lr(lr_logit[turn_mask], lr_target)
+        else:
+            l_lr = state_logit.sum() * 0.0
+
+        # Clipped Signed ROT regression + Straight zero pull + Chiral sign coherence
+        rot_weights = 1.0 + 1.5 * state_t
+        l_rot = torch.mean(rot_weights * F.smooth_l1_loss(rot_pred, rot_t, reduction="none", beta=0.75))
+        l_straight_zero = torch.mean((1.0 - state_t) * (rot_pred ** 2)) * 0.25
+        l_phys = torch.mean(state_t * F.relu(-rot_pred * torch.sign(rot_t)))
+        return l_state + self.lambda_dir * l_dir + self.lambda_lr * l_lr + self.lambda_rot * (l_rot + l_straight_zero) + self.lambda_phys * l_phys
 
 
-def evaluate_predictions(state_probs, dir_probs, rot_preds, state_true, dir_true, rot_true, tau=0.50):
+def build_hierarchical_dir_probs(state_probs, p_stbd_cond):
+    """Combines P(Turn) with P(Starboard | Turn) into a calibrated 3-class distribution."""
+    p_st = np.clip(1.0 - state_probs, 0.0, 1.0)
+    p_sb = np.clip(state_probs * p_stbd_cond, 0.0, 1.0)
+    p_pt = np.clip(state_probs * (1.0 - p_stbd_cond), 0.0, 1.0)
+    return np.column_stack([p_st, p_pt, p_sb])
+
+
+def evaluate_predictions(state_probs, dir_probs, rot_preds, state_true, dir_true, rot_true, tau=0.50, p_stbd_cond=None, tau_lr=0.50):
     pred_bin = (state_probs >= tau).astype(int)
     st_mask = state_true == 0
     tu_mask = state_true == 1
@@ -334,18 +397,28 @@ def evaluate_predictions(state_probs, dir_probs, rot_preds, state_true, dir_true
     bal_acc = 0.5 * (st_acc + tu_acc)
     overall_acc = float(np.mean(pred_bin == state_true))
 
-    # Directional 3-Class (Straight=0, Port=1, Starboard=2)
-    dir_pred = np.argmax(dir_probs, axis=1)
-    dir_overall = float(np.mean(dir_pred == dir_true))
+    auc_roc = float(roc_auc_score(state_true, state_probs)) if len(np.unique(state_true)) > 1 else 0.5
+    pr_auc = float(average_precision_score(state_true, state_probs)) if len(np.unique(state_true)) > 1 else 0.5
+
+    # Hierarchical coherent 3-Class (Straight=0 if p_turn < tau else Port=1 / Starboard=2)
+    if p_stbd_cond is None:
+        denom = dir_probs[:, 1] + dir_probs[:, 2] + 1e-8
+        p_stbd_cond = dir_probs[:, 2] / denom
+    hier_pred = np.where(pred_bin == 0, 0, np.where(p_stbd_cond >= tau_lr, 2, 1))
+    softmax_pred = np.argmax(dir_probs, axis=1)
+
+    dir_overall = float(np.mean(hier_pred == dir_true))
     c_accs = []
     for c in (0, 1, 2):
         m = dir_true == c
-        c_accs.append(float(np.mean(dir_pred[m] == c)) if np.any(m) else 0.0)
+        c_accs.append(float(np.mean(hier_pred[m] == c)) if np.any(m) else 0.0)
     dir_bal = float(np.mean(c_accs))
+
+    sm_accs = [float(np.mean(softmax_pred[dir_true == c] == c)) if np.any(dir_true == c) else 0.0 for c in (0, 1, 2)]
 
     # Port vs Starboard purely on true Turning vessels
     turn_mask = (dir_true == 1) | (dir_true == 2)
-    turn_dir_acc = float(np.mean(np.where(dir_probs[turn_mask, 1] >= dir_probs[turn_mask, 2], 1, 2) == dir_true[turn_mask])) if np.any(turn_mask) else 0.0
+    turn_dir_acc = float(np.mean(np.where(p_stbd_cond[turn_mask] >= tau_lr, 2, 1) == dir_true[turn_mask])) if np.any(turn_mask) else 0.0
 
     # Continuous Signed ROT
     rot_mae = float(np.mean(np.abs(rot_preds - rot_true)))
@@ -355,11 +428,14 @@ def evaluate_predictions(state_probs, dir_probs, rot_preds, state_true, dir_true
 
     return {
         "threshold": float(tau),
+        "threshold_lr": float(tau_lr),
         "n_samples": int(len(state_true)),
         "n_straight": int(np.sum(st_mask)),
         "n_turning": int(np.sum(tu_mask)),
         "balanced_accuracy": bal_acc,
         "overall_accuracy": overall_acc,
+        "auc_roc": auc_roc,
+        "pr_auc": pr_auc,
         "straight_accuracy": st_acc,
         "turning_accuracy": tu_acc,
         "dir_3class_overall_acc": dir_overall,
@@ -367,6 +443,8 @@ def evaluate_predictions(state_probs, dir_probs, rot_preds, state_true, dir_true
         "dir_straight_acc": c_accs[0],
         "dir_port_acc": c_accs[1],
         "dir_starboard_acc": c_accs[2],
+        "softmax_dir_3class_overall_acc": float(np.mean(softmax_pred == dir_true)),
+        "softmax_dir_3class_balanced_acc": float(np.mean(sm_accs)),
         "turn_port_vs_starboard_acc": turn_dir_acc,
         "rot_mae_deg_min": rot_mae,
         "rot_r2": rot_r2,
@@ -413,20 +491,24 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=-1
         with torch.no_grad():
             lee_img = convnext_net.speckle_filter(x_img[:, 0:1]).squeeze().cpu().numpy()
 
-        st_logit, dir_logits, rot_pred = convnext_net(x_img, x_phys)
+        st_logit, dir_logits, rot_pred, lr_logit = convnext_net(x_img, x_phys)
         convnext_net.zero_grad()
 
-        # Target predicted directional class (or binary maneuver score when straight)
-        pred_cls = int(torch.argmax(dir_logits, dim=1).item())
-        score = dir_logits[0, pred_cls] if pred_cls != 0 else st_logit[0]
+        # Target hierarchical predicted turning/direction logit (falls back cleanly for straight ships)
+        p_turn_cx = float(torch.sigmoid(st_logit).item())
+        if p_turn_cx >= 0.5:
+            score = lr_logit[0] if float(torch.sigmoid(lr_logit).item()) >= 0.5 else -lr_logit[0]
+        else:
+            score = -st_logit[0]
         score.backward()
 
+        h_out, w_out = int(img_t.shape[1]), int(img_t.shape[2])
         act = activations[0][0]
         grad = gradients[0][0]
         weights = grad.mean(dim=(1, 2), keepdim=True)
         cam = F.relu((weights * act).sum(dim=0)).cpu().numpy()
         cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-        cam_res = cv2.resize(cam, (256, 256))
+        cam_res = cv2.resize(cam, (w_out, h_out))
 
         # Overlay wake mask contour & compute wake attention concentration
         row = test_ds.df.iloc[idx]
@@ -436,7 +518,7 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=-1
         if os.path.exists(m_path):
             m_img = cv2.imread(m_path, cv2.IMREAD_GRAYSCALE)
             if m_img is not None:
-                m_res = cv2.resize(m_img, (256, 256), interpolation=cv2.INTER_NEAREST)
+                m_res = cv2.resize(m_img, (w_out, h_out), interpolation=cv2.INTER_NEAREST)
                 mask_bin = m_res > 127
                 if np.any(mask_bin):
                     total_e = float(np.sum(cam_res)) + 1e-8
@@ -478,7 +560,7 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=-1
         pd.DataFrame(audit_rows).to_csv(os.path.join(TABLES_DIR, "convnext_gradcam_analysis.csv"), index=False)
 
 
-def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, tau=0.50, w_cx=0.60, num_passes=30):
+def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, tau=0.50, w_cx=0.70, num_passes=30):
     """
     Executes N=30 stochastic MC-Dropout forward passes on the Dual-Branch Ensemble,
     computes Predictive Entropy and Entropy Gap (Incorrect vs Correct), and saves the
@@ -497,8 +579,8 @@ def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, 
             p_batch = []
             for imgs, phys, geom, _, _, _ in test_loader:
                 imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
-                st_log, _, _ = convnext_net(imgs, phys)
-                g_st_log, _ = geom_mlp(geom)
+                st_log, _, _, _ = convnext_net(imgs, phys)
+                g_st_log, _, _ = geom_mlp(geom)
                 p_ens = (w_cx * torch.sigmoid(st_log) + (1.0 - w_cx) * torch.sigmoid(g_st_log)).cpu().numpy()
                 p_batch.append(p_ens)
             pass_probs.append(np.concatenate(p_batch))
@@ -554,11 +636,10 @@ def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, 
     }, mean_prob, epistemic_std, entropy
 
 
-def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base_bal_acc, tau=0.50, w_cx=0.60, batch_size=32):
+def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base_bal_acc, tau=0.50, w_cx=0.70, batch_size=16):
     """Quantifies Balanced Accuracy drop when each Wake/Radon physics feature is randomly permuted."""
     convnext_net.eval()
     geom_mlp.eval()
-    geom_indices = [PHYSICS_FEATURES.index(c) for c in GEOMETRY_FEATURES]
     imp_rows = []
 
     orig_phys_raw = test_ds.phys_raw.copy()
@@ -572,8 +653,8 @@ def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base
         p_all = []
         with torch.no_grad():
             for imgs, phys, geom, _, _, _ in loader:
-                st_log, _, _ = convnext_net(imgs.to(DEVICE), phys.to(DEVICE))
-                g_st_log, _ = geom_mlp(geom.to(DEVICE))
+                st_log, _, _, _ = convnext_net(imgs.to(DEVICE), phys.to(DEVICE))
+                g_st_log, _, _ = geom_mlp(geom.to(DEVICE))
                 p_all.append((w_cx * torch.sigmoid(st_log) + (1.0 - w_cx) * torch.sigmoid(g_st_log)).cpu().numpy())
         p_all = np.concatenate(p_all)
         b = (p_all >= tau).astype(int)
@@ -599,7 +680,138 @@ def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base
     return imp_df
 
 
-def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
+def _flip_physics_batch(phys_norm, geom_norm, phys_mean, phys_std, geom_indices):
+    """Applies exact horizontal mirror sign flip in normalized physics space (odd chiral symmetry)."""
+    phys_raw = phys_norm * phys_std + phys_mean
+    phys_flip_raw = phys_raw.clone()
+    for ci in CHIRAL_PHYS_INDICES:
+        phys_flip_raw[:, ci] = -phys_flip_raw[:, ci]
+    phys_flip_norm = torch.clamp((phys_flip_raw - phys_mean) / phys_std, -8.0, 8.0)
+    geom_flip_norm = phys_flip_norm[:, geom_indices]
+    return phys_flip_norm, geom_flip_norm
+
+
+def predict_neural_branches(convnext_net, geom_mlp, loader, phys_mean_np, phys_std_np, geom_indices, use_tta=True):
+    """Runs Val/Test inference with optional 2x Chiral-Consistent Mirror TTA for exact Port/Starboard symmetry."""
+    convnext_net.eval()
+    geom_mlp.eval()
+    phys_mean_t = torch.tensor(phys_mean_np, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+    phys_std_t = torch.tensor(phys_std_np, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+
+    cx_p, cx_dir, cx_lr, cx_rot = [], [], [], []
+    g_p, g_dir, g_lr = [], [], []
+    times = []
+
+    with torch.no_grad():
+        for imgs, phys, geom, _, _, _ in loader:
+            imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
+            t0 = time.time()
+            st_log, dir_log, rot_out, lr_log = convnext_net(imgs, phys)
+            g_st_log, g_dir_log, g_lr_log = geom_mlp(geom)
+
+            p_cx = torch.sigmoid(st_log)
+            d_cx = torch.softmax(dir_log, dim=1)
+            lr_cx = torch.sigmoid(lr_log)
+            r_cx = rot_out
+
+            p_g = torch.sigmoid(g_st_log)
+            d_g = torch.softmax(g_dir_log, dim=1)
+            lr_g = torch.sigmoid(g_lr_log)
+
+            if use_tta:
+                imgs_f = torch.flip(imgs, dims=[3])
+                phys_f, geom_f = _flip_physics_batch(phys, geom, phys_mean_t, phys_std_t, geom_indices)
+                st_f, dir_f, rot_f, lr_f = convnext_net(imgs_f, phys_f)
+                g_st_f, g_dir_f, g_lr_f = geom_mlp(geom_f)
+
+                p_cx = 0.5 * (p_cx + torch.sigmoid(st_f))
+                d_cx_f = torch.softmax(dir_f, dim=1)[:, [0, 2, 1]]  # swap Port (1) <-> Starboard (2)
+                d_cx = 0.5 * (d_cx + d_cx_f)
+                lr_cx = 0.5 * (lr_cx + (1.0 - torch.sigmoid(lr_f)))
+                r_cx = 0.5 * (r_cx - rot_f)
+
+                p_g = 0.5 * (p_g + torch.sigmoid(g_st_f))
+                d_g_f = torch.softmax(g_dir_f, dim=1)[:, [0, 2, 1]]
+                d_g = 0.5 * (d_g + d_g_f)
+                lr_g = 0.5 * (lr_g + (1.0 - torch.sigmoid(g_lr_f)))
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            times.append((time.time() - t0) / len(imgs))
+
+            cx_p.append(p_cx.cpu().numpy())
+            cx_dir.append(d_cx.cpu().numpy())
+            cx_lr.append(lr_cx.cpu().numpy())
+            cx_rot.append(r_cx.cpu().numpy())
+            g_p.append(p_g.cpu().numpy())
+            g_dir.append(d_g.cpu().numpy())
+            g_lr.append(lr_g.cpu().numpy())
+
+    return {
+        "cx_p": np.concatenate(cx_p),
+        "cx_dir": np.concatenate(cx_dir),
+        "cx_lr": np.concatenate(cx_lr),
+        "cx_rot": np.concatenate(cx_rot),
+        "mlp_p": np.concatenate(g_p),
+        "mlp_dir": np.concatenate(g_dir),
+        "mlp_lr": np.concatenate(g_lr),
+        "mean_latency_s": float(np.mean(times)),
+    }
+
+
+def train_and_predict_hgb(train_ds, eval_datasets):
+    """
+    Branch B2: Enriched Physics HistGradientBoosting Specialist (State + Turning Port/Stbd + Signed ROT).
+    Handles sparse/zero masks natively via tree splits and applies 2x Chiral TTA.
+    """
+    X_tr = build_enriched_tabular_features(train_ds.phys_raw)
+    y_st_tr = train_ds.state_labels
+    y_rot_tr = train_ds.rot_values
+    turn_mask_tr = y_st_tr == 1
+    y_lr_tr = (train_ds.dir_labels[turn_mask_tr] == 2).astype(int)
+
+    clf_state = HistGradientBoostingClassifier(
+        max_iter=250, max_depth=5, learning_rate=0.04, l2_regularization=2.0,
+        class_weight="balanced", random_state=42
+    )
+    clf_state.fit(X_tr, y_st_tr)
+
+    clf_lr = HistGradientBoostingClassifier(
+        max_iter=200, max_depth=4, learning_rate=0.04, l2_regularization=2.0,
+        class_weight="balanced", random_state=42
+    )
+    if np.sum(turn_mask_tr) >= 10 and len(np.unique(y_lr_tr)) == 2:
+        clf_lr.fit(X_tr[turn_mask_tr], y_lr_tr)
+        has_lr = True
+    else:
+        has_lr = False
+
+    reg_rot = HistGradientBoostingRegressor(
+        loss="absolute_error", max_iter=250, max_depth=5, learning_rate=0.04,
+        l2_regularization=2.0, random_state=42
+    )
+    reg_rot.fit(X_tr, y_rot_tr)
+
+    outputs = []
+    for ds in eval_datasets:
+        raw_orig = ds.phys_raw
+        raw_flip = raw_orig.copy()
+        for ci in CHIRAL_PHYS_INDICES:
+            raw_flip[:, ci] = -raw_flip[:, ci]
+        X_e = build_enriched_tabular_features(raw_orig)
+        X_f = build_enriched_tabular_features(raw_flip)
+
+        p_st = 0.5 * (clf_state.predict_proba(X_e)[:, 1] + clf_state.predict_proba(X_f)[:, 1])
+        if has_lr:
+            p_lr = 0.5 * (clf_lr.predict_proba(X_e)[:, 1] + (1.0 - clf_lr.predict_proba(X_f)[:, 1]))
+        else:
+            p_lr = np.full(len(ds), 0.5, dtype=np.float32)
+        rot_e = 0.5 * (reg_rot.predict(X_e) - reg_rot.predict(X_f))
+        outputs.append({"hgb_p": p_st.astype(np.float32), "hgb_lr": p_lr.astype(np.float32), "hgb_rot": rot_e.astype(np.float32)})
+    return outputs
+
+
+def run_master_suite(epochs=35, batch_size=16, lr=2e-4, img_size=384, gradcam_per_class=-1):
     # 1. Load Expanded MMDEC+UEIKAP Dataset if present, else UEIKAP master
     expanded_path = os.path.join(DATA_DIR, "processed", "master_expanded_mmdec.parquet")
     ueikap_path = os.path.join(DATA_DIR, "processed", "maneuver_master.parquet")
@@ -630,9 +842,9 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     print(f"[TRAIN BALANCE] State: {train_df['state'].value_counts().to_dict()} | Dir: {train_df['direction'].value_counts().to_dict()}")
 
     # Fit normalization strictly on Train split
-    train_ds = ScaledManeuverDataset(train_df, augment=True)
-    val_ds = ScaledManeuverDataset(val_df, phys_mean=train_ds.phys_mean, phys_std=train_ds.phys_std, augment=False)
-    test_ds = ScaledManeuverDataset(test_df, phys_mean=train_ds.phys_mean, phys_std=train_ds.phys_std, augment=False)
+    train_ds = ScaledManeuverDataset(train_df, img_size=(img_size, img_size), augment=True)
+    val_ds = ScaledManeuverDataset(val_df, phys_mean=train_ds.phys_mean, phys_std=train_ds.phys_std, img_size=(img_size, img_size), augment=False)
+    test_ds = ScaledManeuverDataset(test_df, phys_mean=train_ds.phys_mean, phys_std=train_ds.phys_std, img_size=(img_size, img_size), augment=False)
 
     # Save scaler stats for future standalone inference
     np.savez(
@@ -642,40 +854,51 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
         features=np.array(PHYSICS_FEATURES)
     )
 
-    # Class balancing sampler + dynamic loss weights
+    # Balanced sampling without extreme class-weight stacking (plus mild 1.8x boost for manual UEIKAP gold wakes)
     n_st = max(1, int(np.sum(train_ds.state_labels == 0)))
     n_tu = max(1, int(np.sum(train_ds.state_labels == 1)))
-    pos_weight = float(np.clip(n_st / n_tu, 1.0, 4.0))
-
-    dir_counts = np.bincount(train_ds.dir_labels, minlength=3).astype(np.float32) + 1.0
-    dir_weights = (dir_counts.sum() / (3.0 * dir_counts))
-    dir_weights = np.clip(dir_weights, 0.5, 5.0)
-
-    sample_weights = np.where(train_ds.state_labels == 1, pos_weight, 1.0)
+    state_bal_w = float(np.clip(n_st / n_tu, 1.0, 2.5))
+    sample_weights = np.where(train_ds.state_labels == 1, state_bal_w, 1.0).astype(np.float64)
+    if "source_dataset" in train_df.columns:
+        is_ueikap = (train_df["source_dataset"].values == "UEIKAP")
+        sample_weights = sample_weights * np.where(is_ueikap, 1.8, 1.0)
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(train_ds), replacement=True)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, drop_last=True, num_workers=2 if IS_KAGGLE else 0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2 if IS_KAGGLE else 0)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2 if IS_KAGGLE else 0)
 
-    # Instantiate Dual-Branch Ensemble Models
+    # Instantiate Dual-Branch Neural Models
     convnext_net = ConvNeXtPhysicsNet(num_physics_features=len(PHYSICS_FEATURES), pretrained=True).to(DEVICE)
     geom_mlp = GeometrySpecialistMLP(in_features=len(GEOMETRY_FEATURES)).to(DEVICE)
 
-    criterion = PhysicsInformedMultiTaskLoss(pos_weight=1.0, dir_weights=dir_weights).to(DEVICE)
-    bce_geom = nn.BCEWithLogitsLoss()
-    ce_geom_dir = nn.CrossEntropyLoss(weight=torch.tensor(dir_weights, dtype=torch.float32, device=DEVICE))
+    dir_weights = np.array([0.85, 1.15, 1.15], dtype=np.float32)
+    criterion = PhysicsInformedMultiTaskLoss(pos_weight=1.25, dir_weights=dir_weights).to(DEVICE)
+    bce_geom = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.25], device=DEVICE))
+    ce_geom_dir = nn.CrossEntropyLoss(weight=torch.tensor(dir_weights, dtype=torch.float32, device=DEVICE), label_smoothing=0.05)
+    bce_geom_lr = nn.BCEWithLogitsLoss()
 
-    optimizer = torch.optim.AdamW([
-        {"params": convnext_net.backbone.parameters(), "lr": lr * 0.5},
-        {"params": convnext_net.physics_mlp.parameters(), "lr": lr},
-        {"params": convnext_net.shared_head.parameters(), "lr": lr},
-        {"params": convnext_net.binary_head.parameters(), "lr": lr},
-        {"params": convnext_net.direction_head.parameters(), "lr": lr},
-        {"params": convnext_net.rot_head.parameters(), "lr": lr},
-        {"params": geom_mlp.parameters(), "lr": lr * 2.0},
+    # Decoupled optimizers: ConvNeXt (warmup + cosine) & Geometry MLP (FP32)
+    opt_cx = torch.optim.AdamW([
+        {"params": convnext_net.backbone.parameters(), "lr": lr * 0.4},
+        {"params": convnext_net.physics_mlp.parameters(), "lr": lr * 1.2},
+        {"params": convnext_net.shared_head.parameters(), "lr": lr * 1.2},
+        {"params": convnext_net.binary_head.parameters(), "lr": lr * 1.2},
+        {"params": convnext_net.direction_head.parameters(), "lr": lr * 1.2},
+        {"params": convnext_net.turn_lr_head.parameters(), "lr": lr * 1.2},
+        {"params": convnext_net.rot_head.parameters(), "lr": lr * 1.2},
     ], weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    warmup_epochs = min(3, max(1, epochs // 10))
+
+    def _lr_lambda(ep_idx):
+        if ep_idx < warmup_epochs:
+            return float(ep_idx + 1) / float(warmup_epochs)
+        progress = float(ep_idx - warmup_epochs) / float(max(1, epochs - warmup_epochs))
+        return max(0.01, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+    sched_cx = torch.optim.lr_scheduler.LambdaLR(opt_cx, lr_lambda=_lr_lambda)
+    opt_geom = torch.optim.AdamW(geom_mlp.parameters(), lr=max(lr * 3.0, 5e-4), weight_decay=1e-4)
+    sched_geom = torch.optim.lr_scheduler.CosineAnnealingLR(opt_geom, T_max=epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
 
     best_cx_score = -1.0
@@ -685,69 +908,64 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     for epoch in range(1, epochs + 1):
         convnext_net.train()
         geom_mlp.train()
-        running_loss = 0.0
+        running_cx_loss = 0.0
+        running_g_loss = 0.0
 
         for imgs, phys, geom, state_t, dir_t, rot_t in train_loader:
             imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
             state_t, dir_t, rot_t = state_t.to(DEVICE), dir_t.to(DEVICE), rot_t.to(DEVICE)
 
-            optimizer.zero_grad()
+            # Branch A: ConvNeXt-Tiny + Lee + Physics (AMP)
+            opt_cx.zero_grad()
             with torch.amp.autocast("cuda", enabled=(DEVICE.type == "cuda")):
-                st_log, dir_log, rot_out = convnext_net(imgs, phys)
-                g_st_log, g_dir_log = geom_mlp(geom)
-
-                loss_cx = criterion(st_log, dir_log, rot_out, state_t, dir_t, rot_t, phys[:, 5])
-                loss_g = bce_geom(g_st_log, state_t) + 0.4 * ce_geom_dir(g_dir_log, dir_t)
-                loss = loss_cx + 0.5 * loss_g
-
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(list(convnext_net.parameters()) + list(geom_mlp.parameters()), max_norm=2.0)
-            scaler.step(optimizer)
+                st_log, dir_log, rot_out, lr_log = convnext_net(imgs, phys)
+                loss_cx = criterion(st_log, dir_log, rot_out, lr_log, state_t, dir_t, rot_t)
+            scaler.scale(loss_cx).backward()
+            scaler.unscale_(opt_cx)
+            torch.nn.utils.clip_grad_norm_(convnext_net.parameters(), max_norm=2.0)
+            scaler.step(opt_cx)
             scaler.update()
-            running_loss += loss.item() * len(state_t)
 
-        scheduler.step()
-        train_loss = running_loss / max(1, len(train_loader.dataset))
+            # Branch B1: Geometry Specialist MLP (clean FP32)
+            opt_geom.zero_grad()
+            g_st_log, g_dir_log, g_lr_log = geom_mlp(geom)
+            turn_m = state_t > 0.5
+            loss_g_lr = bce_geom_lr(g_lr_log[turn_m], (dir_t[turn_m] == 2).float()) if torch.any(turn_m) else (g_st_log.sum() * 0.0)
+            loss_g = bce_geom(g_st_log, state_t) + 0.5 * ce_geom_dir(g_dir_log, dir_t) + 0.5 * loss_g_lr
+            loss_g.backward()
+            torch.nn.utils.clip_grad_norm_(geom_mlp.parameters(), max_norm=2.0)
+            opt_geom.step()
 
-        # Independent Validation Check for ConvNeXt Branch A & Geometry MLP Branch B
-        convnext_net.eval()
-        geom_mlp.eval()
-        vcx_p, vg_p, v_dir_cx, v_dir_g, v_rot_p = [], [], [], [], []
-        v_st_t, v_dir_t, v_rot_t = [], [], []
+            running_cx_loss += loss_cx.item() * len(state_t)
+            running_g_loss += loss_g.item() * len(state_t)
 
-        with torch.no_grad():
-            for imgs, phys, geom, state_t, dir_t, rot_t in val_loader:
-                imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
-                st_log, dir_log, rot_out = convnext_net(imgs, phys)
-                g_st_log, g_dir_log = geom_mlp(geom)
+        sched_cx.step()
+        sched_geom.step()
+        train_cx_loss = running_cx_loss / max(1, len(train_loader.dataset))
+        train_g_loss = running_g_loss / max(1, len(train_loader.dataset))
 
-                vcx_p.append(torch.sigmoid(st_log).cpu().numpy())
-                vg_p.append(torch.sigmoid(g_st_log).cpu().numpy())
-                v_dir_cx.append(torch.softmax(dir_log, dim=1).cpu().numpy())
-                v_dir_g.append(torch.softmax(g_dir_log, dim=1).cpu().numpy())
-                v_rot_p.append(rot_out.cpu().numpy())
-                v_st_t.append(state_t.numpy())
-                v_dir_t.append(dir_t.numpy())
-                v_rot_t.append(rot_t.numpy())
+        # Validation with 2x Chiral TTA
+        val_out = predict_neural_branches(
+            convnext_net, geom_mlp, val_loader, train_ds.phys_mean, train_ds.phys_std, train_ds.geom_indices, use_tta=True
+        )
+        cx_stbd = 0.5 * val_out["cx_lr"] + 0.5 * (val_out["cx_dir"][:, 2] / (val_out["cx_dir"][:, 1] + val_out["cx_dir"][:, 2] + 1e-8))
+        g_stbd = 0.5 * val_out["mlp_lr"] + 0.5 * (val_out["mlp_dir"][:, 2] / (val_out["mlp_dir"][:, 1] + val_out["mlp_dir"][:, 2] + 1e-8))
 
-        vcx_p_np = np.concatenate(vcx_p)
-        vg_p_np = np.concatenate(vg_p)
-        v_dir_cx_np = np.concatenate(v_dir_cx)
-        v_dir_g_np = np.concatenate(v_dir_g)
-        v_rot_np = np.concatenate(v_rot_p)
-        v_st_np = np.concatenate(v_st_t)
-        v_dir_np = np.concatenate(v_dir_t)
-        v_rot_t_np = np.concatenate(v_rot_t)
+        cx_res = evaluate_predictions(
+            val_out["cx_p"], val_out["cx_dir"], val_out["cx_rot"],
+            val_ds.state_labels, val_ds.dir_labels, val_ds.rot_values, tau=0.50, p_stbd_cond=cx_stbd
+        )
+        g_res = evaluate_predictions(
+            val_out["mlp_p"], val_out["mlp_dir"], val_out["cx_rot"],
+            val_ds.state_labels, val_ds.dir_labels, val_ds.rot_values, tau=0.50, p_stbd_cond=g_stbd
+        )
 
-        cx_res = evaluate_predictions(vcx_p_np, v_dir_cx_np, v_rot_np, v_st_np, v_dir_np, v_rot_t_np, tau=0.50)
-        g_res = evaluate_predictions(vg_p_np, v_dir_g_np, v_rot_np, v_st_np, v_dir_np, v_rot_t_np, tau=0.50)
-
-        cx_score = 0.7 * cx_res["balanced_accuracy"] + 0.3 * cx_res["dir_3class_balanced_acc"]
-        g_score = 0.7 * g_res["balanced_accuracy"] + 0.3 * g_res["dir_3class_balanced_acc"]
+        cx_score = 0.45 * cx_res["balanced_accuracy"] + 0.25 * cx_res["auc_roc"] + 0.30 * cx_res["dir_3class_balanced_acc"]
+        g_score = 0.50 * g_res["balanced_accuracy"] + 0.25 * g_res["auc_roc"] + 0.25 * g_res["dir_3class_balanced_acc"]
 
         print(
-            f"Epoch {epoch:02d}/{epochs:02d} | Loss: {train_loss:.4f} | "
-            f"ConvNeXt BalAcc: {cx_res['balanced_accuracy']*100:.1f}% (Dir:{cx_res['dir_3class_balanced_acc']*100:.1f}%) | "
+            f"Epoch {epoch:02d}/{epochs:02d} | LossCX: {train_cx_loss:.4f} | LossG: {train_g_loss:.4f} | "
+            f"ConvNeXt BalAcc: {cx_res['balanced_accuracy']*100:.1f}% (AUC:{cx_res['auc_roc']:.3f}, Dir3:{cx_res['dir_3class_balanced_acc']*100:.1f}%, P/S:{cx_res['turn_port_vs_starboard_acc']*100:.1f}%) | "
             f"GeomMLP BalAcc: {g_res['balanced_accuracy']*100:.1f}%"
         )
 
@@ -761,68 +979,133 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     print(f"\n[TRAINING COMPLETE] Elapsed: {(time.time() - t_start)/60.0:.2f} min")
 
     # ----------------------------------------------------------------------------------------------
-    # Calibrate Optimal Soft-Voting Weight w & Threshold tau Strictly on Validation Split!
+    # Train Branch B2: Pure Physics HistGradientBoosting Specialist + Multi-Branch Val Calibration
     # ----------------------------------------------------------------------------------------------
+    val_hgb, test_hgb = train_and_predict_hgb(train_ds, [val_ds, test_ds])
+
     convnext_net.load_state_dict(torch.load(os.path.join(CHECKPOINTS_DIR, "convnext_multitask_best.pt"), map_location=DEVICE))
     geom_mlp.load_state_dict(torch.load(os.path.join(CHECKPOINTS_DIR, "geometry_mlp_best.pt"), map_location=DEVICE))
-    convnext_net.eval()
-    geom_mlp.eval()
 
-    vcx_p, vg_p, v_st_t = [], [], []
-    with torch.no_grad():
-        for imgs, phys, geom, state_t, _, _ in val_loader:
-            st_log, _, _ = convnext_net(imgs.to(DEVICE), phys.to(DEVICE))
-            g_st_log, _ = geom_mlp(geom.to(DEVICE))
-            vcx_p.append(torch.sigmoid(st_log).cpu().numpy())
-            vg_p.append(torch.sigmoid(g_st_log).cpu().numpy())
-            v_st_t.append(state_t.numpy())
-    vcx_p, vg_p, v_st_t = np.concatenate(vcx_p), np.concatenate(vg_p), np.concatenate(v_st_t)
+    val_neural = predict_neural_branches(
+        convnext_net, geom_mlp, val_loader, train_ds.phys_mean, train_ds.phys_std, train_ds.geom_indices, use_tta=True
+    )
+    test_neural = predict_neural_branches(
+        convnext_net, geom_mlp, test_loader, train_ds.phys_mean, train_ds.phys_std, train_ds.geom_indices, use_tta=True
+    )
 
-    best_w, best_tau, best_val_bal = 0.60, 0.50, 0.0
-    for w in (0.30, 0.40, 0.50, 0.60, 0.70, 0.80):
-        v_ens = w * vcx_p + (1.0 - w) * vg_p
-        for tau in np.arange(0.30, 0.76, 0.02):
-            b = (v_ens >= tau).astype(int)
-            bal = 0.5 * (np.mean(b[v_st_t == 0] == 0) + np.mean(b[v_st_t == 1] == 1))
-            if bal > best_val_bal:
-                best_val_bal = bal
-                best_w = float(w)
-                best_tau = float(tau)
+    v_st_t = val_ds.state_labels
+    v_dir_t = val_ds.dir_labels
+    v_rot_t = val_ds.rot_values
 
-    print(f"[CALIBRATION ON VAL] Optimal Soft-Vote Weight w_ConvNeXt={best_w:.2f}, tau={best_tau:.2f} -> Val BalAcc={best_val_bal*100:.2f}%")
+    # 1. Calibrate Binary Ensemble Weights (w_cx, w_mlp, w_hgb) & Threshold tau on Val
+    best_weights = (0.75, 0.10, 0.15)
+    best_tau = 0.50
+    best_val_obj = -1.0
+    for w_cx in (0.50, 0.60, 0.70, 0.80, 0.90):
+        for w_hgb in (0.00, 0.10, 0.20, 0.30):
+            w_mlp = round(1.0 - w_cx - w_hgb, 2)
+            if w_mlp < -1e-6 or w_mlp > 0.40:
+                continue
+            w_mlp = max(0.0, w_mlp)
+            v_ens = w_cx * val_neural["cx_p"] + w_mlp * val_neural["mlp_p"] + w_hgb * val_hgb["hgb_p"]
+            v_auc = float(roc_auc_score(v_st_t, v_ens)) if len(np.unique(v_st_t)) > 1 else 0.5
+            for tau in np.arange(0.32, 0.74, 0.02):
+                b = (v_ens >= tau).astype(int)
+                st_a = np.mean(b[v_st_t == 0] == 0)
+                tu_a = np.mean(b[v_st_t == 1] == 1)
+                bal = 0.5 * (st_a + tu_a)
+                obj = 0.85 * bal + 0.15 * v_auc
+                if obj > best_val_obj:
+                    best_val_obj = obj
+                    best_weights = (float(w_cx), float(w_mlp), float(w_hgb))
+                    best_tau = float(tau)
+
+    w_cx, w_mlp, w_hgb = best_weights
+    v_ens = w_cx * val_neural["cx_p"] + w_mlp * val_neural["mlp_p"] + w_hgb * val_hgb["hgb_p"]
+    v_auc = float(roc_auc_score(v_st_t, v_ens)) if len(np.unique(v_st_t)) > 1 else 0.5
+    v_bal = 0.5 * (np.mean((v_ens >= best_tau)[v_st_t == 0] == 0) + np.mean((v_ens >= best_tau)[v_st_t == 1] == 1))
+
+    # 2. Calibrate Port vs Starboard Mix & Threshold tau_lr Strictly on Turning Validation Samples
+    val_cx_lr = 0.65 * val_neural["cx_lr"] + 0.35 * (val_neural["cx_dir"][:, 2] / (val_neural["cx_dir"][:, 1] + val_neural["cx_dir"][:, 2] + 1e-8))
+    val_mlp_lr = val_neural["mlp_lr"]
+    val_turn_m = v_st_t == 1
+    best_lr_mix, best_tau_lr, best_lr_acc = (0.75, 0.10, 0.15), 0.50, -1.0
+    if np.any(val_turn_m):
+        for lc in (0.60, 0.75, 0.90, 1.00):
+            for lh in (0.00, 0.15, 0.25):
+                lm = round(1.0 - lc - lh, 2)
+                if lm < -1e-6:
+                    continue
+                lm = max(0.0, lm)
+                p_lr_v = lc * val_cx_lr + lm * val_mlp_lr + lh * val_hgb["hgb_lr"]
+                for t_lr in np.arange(0.42, 0.59, 0.02):
+                    pred_lr = np.where(p_lr_v[val_turn_m] >= t_lr, 2, 1)
+                    acc_lr = float(np.mean(pred_lr == v_dir_t[val_turn_m]))
+                    if acc_lr > best_lr_acc:
+                        best_lr_acc = acc_lr
+                        best_lr_mix = (float(lc), float(lm), float(lh))
+                        best_tau_lr = float(t_lr)
+
+    lc, lm, lh = best_lr_mix
+
+    # 3. Calibrate Signed ROT Regression Blend & Straight Gate Strictly on Validation R^2
+    best_alpha_rot, best_st_scale, best_val_r2 = 0.85, 0.20, -99.0
+    v_pred_bin = (v_ens >= best_tau)
+    for alpha_r in (0.65, 0.80, 0.90, 1.00):
+        r_blend = alpha_r * val_neural["cx_rot"] + (1.0 - alpha_r) * val_hgb["hgb_rot"]
+        for st_sc in (0.0, 0.20, 0.50, 1.0):
+            r_eval = np.where(v_pred_bin, r_blend, st_sc * r_blend)
+            ss_res = np.sum((v_rot_t - r_eval) ** 2)
+            ss_tot = np.sum((v_rot_t - np.mean(v_rot_t)) ** 2) + 1e-6
+            r2 = float(1.0 - ss_res / ss_tot)
+            if r2 > best_val_r2:
+                best_val_r2 = r2
+                best_alpha_rot = float(alpha_r)
+                best_st_scale = float(st_sc)
+
+    print(f"[CALIBRATION ON VAL] Weights(CX/MLP/HGB)=({w_cx:.2f}, {w_mlp:.2f}, {w_hgb:.2f}), tau={best_tau:.2f} -> Val BalAcc={v_bal*100:.2f}%, Val AUC={v_auc:.4f}")
+    print(f"[CALIBRATION DIR/ROT] LR Mix=({lc:.2f}, {lm:.2f}, {lh:.2f}), tau_lr={best_tau_lr:.2f} (Val Turn P/S={best_lr_acc*100:.1f}%), alpha_rot={best_alpha_rot:.2f}, st_scale={best_st_scale:.2f} (Val R2={best_val_r2:.3f})")
 
     # ----------------------------------------------------------------------------------------------
-    # Final Evaluation on Unseen Test Split (Full & Frozen UEIKAP Subset)
+    # Final Evaluation on Unseen Test Split (Full Ensemble + Branch Ablations + Frozen UEIKAP)
     # ----------------------------------------------------------------------------------------------
-    t_st_p, t_dir_p, t_rot_p, times = [], [], [], []
-    with torch.no_grad():
-        for imgs, phys, geom, _, _, _ in test_loader:
-            imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
-            t0 = time.time()
-            st_log, dir_log, rot_out = convnext_net(imgs, phys)
-            g_st_log, g_dir_log = geom_mlp(geom)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            times.append((time.time() - t0) / len(imgs))
+    t_st_p = w_cx * test_neural["cx_p"] + w_mlp * test_neural["mlp_p"] + w_hgb * test_hgb["hgb_p"]
+    test_cx_lr = 0.65 * test_neural["cx_lr"] + 0.35 * (test_neural["cx_dir"][:, 2] / (test_neural["cx_dir"][:, 1] + test_neural["cx_dir"][:, 2] + 1e-8))
+    t_stbd_cond = lc * test_cx_lr + lm * test_neural["mlp_lr"] + lh * test_hgb["hgb_lr"]
+    t_dir_p = build_hierarchical_dir_probs(t_st_p, t_stbd_cond)
 
-            t_st_p.append((best_w * torch.sigmoid(st_log) + (1.0 - best_w) * torch.sigmoid(g_st_log)).cpu().numpy())
-            t_dir_p.append((best_w * torch.softmax(dir_log, dim=1) + (1.0 - best_w) * torch.softmax(g_dir_log, dim=1)).cpu().numpy())
-            t_rot_p.append(rot_out.cpu().numpy())
-
-    t_st_p = np.concatenate(t_st_p)
-    t_dir_p = np.concatenate(t_dir_p)
-    t_rot_p = np.concatenate(t_rot_p)
+    t_rot_raw = best_alpha_rot * test_neural["cx_rot"] + (1.0 - best_alpha_rot) * test_hgb["hgb_rot"]
+    t_rot_p = np.where(t_st_p >= best_tau, t_rot_raw, best_st_scale * t_rot_raw)
 
     full_metrics = evaluate_predictions(
         t_st_p, t_dir_p, t_rot_p,
         test_ds.state_labels, test_ds.dir_labels, test_ds.rot_values,
-        tau=best_tau
+        tau=best_tau, p_stbd_cond=t_stbd_cond, tau_lr=best_tau_lr
     )
-    full_metrics["calibrated_w_convnext"] = best_w
-    full_metrics["latency_ms_per_ship"] = float(np.mean(times) * 1000.0)
-    full_metrics["throughput_fps"] = float(1.0 / (np.mean(times) + 1e-6))
+    full_metrics["calibrated_weights"] = {"convnext": w_cx, "geom_mlp": w_mlp, "geom_hgb": w_hgb}
+    full_metrics["latency_ms_per_ship"] = float(test_neural["mean_latency_s"] * 1000.0)
+    full_metrics["throughput_fps"] = float(1.0 / (test_neural["mean_latency_s"] + 1e-6))
 
     results = {"expanded_test": full_metrics}
+
+    # Branch Ablation Audit (All thresholds 0.50 or Val-calibrated cleanly on test)
+    results["branch_ablations"] = {
+        "convnext_only": evaluate_predictions(
+            test_neural["cx_p"], test_neural["cx_dir"], test_neural["cx_rot"],
+            test_ds.state_labels, test_ds.dir_labels, test_ds.rot_values,
+            tau=best_tau, p_stbd_cond=test_cx_lr, tau_lr=best_tau_lr
+        ),
+        "geom_mlp_only": evaluate_predictions(
+            test_neural["mlp_p"], test_neural["mlp_dir"], test_hgb["hgb_rot"],
+            test_ds.state_labels, test_ds.dir_labels, test_ds.rot_values,
+            tau=0.50, p_stbd_cond=test_neural["mlp_lr"], tau_lr=0.50
+        ),
+        "geom_hgb_only": evaluate_predictions(
+            test_hgb["hgb_p"], build_hierarchical_dir_probs(test_hgb["hgb_p"], test_hgb["hgb_lr"]), test_hgb["hgb_rot"],
+            test_ds.state_labels, test_ds.dir_labels, test_ds.rot_values,
+            tau=0.50, p_stbd_cond=test_hgb["hgb_lr"], tau_lr=0.50
+        ),
+    }
 
     # Evaluate separately on Original Frozen UEIKAP Test Set if present
     if "source_dataset" in test_df.columns:
@@ -831,16 +1114,17 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
             ueikap_metrics = evaluate_predictions(
                 t_st_p[ueikap_mask], t_dir_p[ueikap_mask], t_rot_p[ueikap_mask],
                 test_ds.state_labels[ueikap_mask], test_ds.dir_labels[ueikap_mask], test_ds.rot_values[ueikap_mask],
-                tau=best_tau
+                tau=best_tau, p_stbd_cond=t_stbd_cond[ueikap_mask], tau_lr=best_tau_lr
             )
             results["ueikap_frozen_test"] = ueikap_metrics
 
     # ----------------------------------------------------------------------------------------------
     # Epistemic Uncertainty Quantification (N=30 MC-Dropout Passes) & Selective Rejection Curve
     # ----------------------------------------------------------------------------------------------
+    w_neural_sum = max(1e-6, w_cx + w_mlp)
     print("\n[UNCERTAINTY] Running N=30 MC-Dropout passes across unseen test set...")
     unc_metrics, mc_mean, mc_std, mc_entropy = run_mc_dropout_uncertainty(
-        convnext_net, geom_mlp, test_loader, test_ds.state_labels, tau=best_tau, w_cx=best_w, num_passes=30
+        convnext_net, geom_mlp, test_loader, test_ds.state_labels, tau=best_tau, w_cx=(w_cx / w_neural_sum), num_passes=30
     )
     results["mc_dropout_uncertainty"] = unc_metrics
 
@@ -849,7 +1133,7 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     # ----------------------------------------------------------------------------------------------
     print("[EXPLAINABILITY] Computing permutation importance across 12 Wake/Radon features...")
     imp_df = compute_physics_permutation_importance(
-        convnext_net, geom_mlp, test_ds, full_metrics["balanced_accuracy"], tau=best_tau, w_cx=best_w, batch_size=batch_size
+        convnext_net, geom_mlp, test_ds, full_metrics["balanced_accuracy"], tau=best_tau, w_cx=(w_cx / w_neural_sum), batch_size=batch_size
     )
     results["top_physics_features"] = imp_df.head(5).to_dict("records")
 
@@ -861,15 +1145,16 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     with open(os.path.join(CHECKPOINTS_DIR, "master_evaluation_metrics.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    # Save test predictions parquet with per-vessel Uncertainty metrics
+    # Save coherent hierarchical test predictions parquet
     pred_out = test_df[["sample_id", "source_dataset", "state", "direction"]].copy() if "source_dataset" in test_df.columns else test_df[["sample_id", "state", "direction"]].copy()
     pred_out["prob_turn_ensemble"] = t_st_p
+    pred_out["prob_starboard_cond"] = t_stbd_cond
     pred_out["mc_mean_prob"] = mc_mean
     pred_out["epistemic_std"] = mc_std
     pred_out["predictive_entropy"] = mc_entropy
-    pred_out["pred_state"] = np.where(t_st_p >= best_tau, "Turning", "Straight")
-    inv_dir = {0: "None", 1: "Port", 2: "Starboard"}
-    pred_out["pred_direction"] = [inv_dir[int(c)] for c in np.argmax(t_dir_p, axis=1)]
+    pred_bin_out = (t_st_p >= best_tau)
+    pred_out["pred_state"] = np.where(pred_bin_out, "Turning", "Straight")
+    pred_out["pred_direction"] = np.where(~pred_bin_out, "None", np.where(t_stbd_cond >= best_tau_lr, "Starboard", "Port"))
     pred_out["pred_rot_deg_min"] = t_rot_p
     pred_out.to_parquet(os.path.join(DATA_DIR, "processed", "expanded_test_predictions.parquet"), index=False)
 
@@ -886,8 +1171,9 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Dual-Branch ConvNeXt + Lee + Geometry Ensemble")
     parser.add_argument("--epochs", type=int, default=35)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--img_size", type=int, default=384)
     parser.add_argument("--gradcam_per_class", type=int, default=-1, help="-1 generates Grad-CAM for ALL test images")
     args = parser.parse_args()
-    run_master_suite(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, gradcam_per_class=args.gradcam_per_class)
+    run_master_suite(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, img_size=args.img_size, gradcam_per_class=args.gradcam_per_class)

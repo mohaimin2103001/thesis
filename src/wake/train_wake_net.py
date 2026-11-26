@@ -63,6 +63,10 @@ class WakeDataset(Dataset):
             if k > 0:
                 img = np.rot90(img, k).copy()
                 mask = np.rot90(mask, k).copy()
+            if np.random.rand() < 0.35:
+                alpha_c = np.random.uniform(0.88, 1.12)
+                beta_c = np.random.uniform(-10.0, 10.0)
+                img = np.clip(img.astype(np.float32) * alpha_c + beta_c, 0, 255).astype(np.uint8)
 
         img_tensor = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
         mask_tensor = torch.from_numpy((mask > 127).astype(np.float32)).unsqueeze(0)
@@ -72,10 +76,11 @@ class WakeDataset(Dataset):
 
 class TverskyDiceBCELoss(nn.Module):
     """
-    Combines pos-weighted BCE + Tversky + Dice to solve extreme 98:2 ocean:wake imbalance.
-    Higher beta (0.65) boosts recall on faint thin wake filaments.
+    Stabilized batch-global Focal/BCE + Tversky + Dice loss for extreme ocean:wake imbalance.
+    Batch-global reduction avoids gradient spikes from sparse/tiny wake masks while balanced
+    pos_weight keeps predicted probabilities well-calibrated around 0.5.
     """
-    def __init__(self, pos_weight=4.0, alpha=0.35, beta=0.65, smooth=1e-5):
+    def __init__(self, pos_weight=2.0, alpha=0.45, beta=0.55, smooth=1.0):
         super().__init__()
         self.pos_weight_val = pos_weight
         self.alpha = alpha
@@ -87,13 +92,14 @@ class TverskyDiceBCELoss(nn.Module):
         bce_loss = nn.functional.binary_cross_entropy_with_logits(logits, targets, pos_weight=pw)
 
         probs = torch.sigmoid(logits)
-        tp = (probs * targets).sum(dim=(2, 3))
-        fp = (probs * (1.0 - targets)).sum(dim=(2, 3))
-        fn = ((1.0 - probs) * targets).sum(dim=(2, 3))
+        # Batch-global reduction prevents tiny per-sample target denominator spikes
+        tp = (probs * targets).sum()
+        fp = (probs * (1.0 - targets)).sum()
+        fn = ((1.0 - probs) * targets).sum()
 
         tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
         dice = (2.0 * tp + self.smooth) / (2.0 * tp + fp + fn + self.smooth)
-        return 0.35 * bce_loss + 0.35 * (1.0 - tversky.mean()) + 0.30 * (1.0 - dice.mean())
+        return 0.30 * bce_loss + 0.35 * (1.0 - tversky) + 0.35 * (1.0 - dice)
 
 
 def build_wake_net_model(encoder_name="resnet50", in_channels=1, classes=1, pretrained=True):
@@ -146,16 +152,18 @@ def _fast_radon_dominant_angle(binary_region, bin_width=2.5):
     return float(_THETA_DEG[best_idx])
 
 
-def compute_radon_wake_kinematics(binary_mask, sog_knots=None, pixel_res_meters=10.0):
+def compute_radon_wake_kinematics(binary_mask, sog_knots=None, pixel_res_meters=10.0, ship_point=None):
     """
-    Paper 3 Hybridization: Applies morphological denoising + fast sparse Radon Transform
-    to segmented wake mask to compute wake axis orientation theta and angular deflection Delta theta.
+    Orientation-invariant Hybridization: Applies morphological denoising + fast sparse Radon Transform
+    along the true principal wake axis (splitting proximal near-ship vs distal wake tail rather than fixed y//2)
+    to compute dominant orientation theta and signed angular deflection Delta theta.
     """
     bool_clean = remove_small_objects(binary_mask > 127, min_size=30)
     clean_mask = (bool_clean.astype(np.uint8)) * 255
     h, w = clean_mask.shape
 
-    if np.sum(clean_mask > 0) < 40:
+    ys, xs = np.where(clean_mask > 0)
+    if len(xs) < 40:
         return {
             "dominant_angle_deg": 0.0,
             "angular_deflection_deg": 0.0,
@@ -166,13 +174,34 @@ def compute_radon_wake_kinematics(binary_mask, sog_knots=None, pixel_res_meters=
 
     dominant_angle_deg = _fast_radon_dominant_angle(clean_mask)
 
-    mid_y = h // 2
-    proximal_window = clean_mask[:mid_y, :]
-    distal_window = clean_mask[mid_y:, :]
+    # Orient wake axis from ship center toward tail (invariant to horizontal/vertical wake heading)
+    if ship_point is None:
+        ship_point = (w * 0.5, h * 0.5)
+    pts = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
+    mean_pt = pts.mean(axis=0)
+    centered = pts - mean_pt
+    cov = np.cov(centered.T) if len(pts) > 2 else np.eye(2)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    principal = eigvecs[:, np.argmax(eigvals)]
 
-    if np.sum(proximal_window > 0) > 25 and np.sum(distal_window > 0) > 25:
-        theta_prox = _fast_radon_dominant_angle(proximal_window)
-        theta_dist = _fast_radon_dominant_angle(distal_window)
+    # Ensure principal vector points away from ship_point into the wake tail
+    s_proj = centered @ principal
+    s_ship = (np.array([ship_point[0], ship_point[1]]) - mean_pt) @ principal
+    if np.median(s_proj) < s_ship:
+        principal = -principal
+        s_proj = -s_proj
+
+    s_med = float(np.median(s_proj))
+    prox_mask = np.zeros_like(clean_mask)
+    dist_mask = np.zeros_like(clean_mask)
+    prox_idx = s_proj <= s_med
+    dist_idx = s_proj > s_med
+    prox_mask[ys[prox_idx], xs[prox_idx]] = 255
+    dist_mask[ys[dist_idx], xs[dist_idx]] = 255
+
+    if np.sum(prox_mask > 0) > 20 and np.sum(dist_mask > 0) > 20:
+        theta_prox = _fast_radon_dominant_angle(prox_mask)
+        theta_dist = _fast_radon_dominant_angle(dist_mask)
 
         deflection = (theta_dist - theta_prox + 180.0) % 180.0
         if deflection > 90.0:
@@ -181,8 +210,9 @@ def compute_radon_wake_kinematics(binary_mask, sog_knots=None, pixel_res_meters=
     else:
         angular_deflection_deg = 0.0
 
-    delta_s_meters = (h / 2.0) * pixel_res_meters
-    kappa_est = np.radians(angular_deflection_deg) / (delta_s_meters + 1e-6)
+    wake_span_px = float(np.percentile(s_proj, 95) - np.percentile(s_proj, 5))
+    delta_s_meters = max(100.0, 0.5 * wake_span_px * pixel_res_meters)
+    kappa_est = np.radians(angular_deflection_deg) / delta_s_meters
 
     rot_est = 0.0
     if sog_knots is not None and sog_knots > 1.0:
@@ -254,10 +284,10 @@ def load_segmentation_splits():
     return train_df, val_df, test_df
 
 
-def train_wake_net(epochs=35, batch_size=8, lr=3e-4, device=None):
+def train_wake_net(epochs=35, batch_size=8, lr=2e-4, device=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[WAKE-NET] Training ResNet-50 + scSE Attention (CLAHE + Tversky/Dice) on device: {device}")
+    print(f"[WAKE-NET] Training ResNet-50 + scSE Attention (CLAHE + Stabilized Batch-Global Tversky/Dice) on device: {device}")
 
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
     os.makedirs(LOGS_DIR, exist_ok=True)
@@ -275,7 +305,7 @@ def train_wake_net(epochs=35, batch_size=8, lr=3e-4, device=None):
     model = build_wake_net_model(encoder_name="resnet50", in_channels=1, classes=1, pretrained=True).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    criterion = TverskyDiceBCELoss(pos_weight=4.0, alpha=0.35, beta=0.65)
+    criterion = TverskyDiceBCELoss(pos_weight=2.0, alpha=0.45, beta=0.55, smooth=1.0)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     best_val_dice = 0.0
@@ -292,6 +322,8 @@ def train_wake_net(epochs=35, batch_size=8, lr=3e-4, device=None):
                 logits = model(imgs)
                 loss = criterion(logits, masks)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             scaler.step(optimizer)
             scaler.update()
             train_loss += loss.item() * len(imgs)
@@ -317,15 +349,16 @@ def train_wake_net(epochs=35, batch_size=8, lr=3e-4, device=None):
         val_preds = np.concatenate(val_preds, axis=0)
         val_targets = np.concatenate(val_targets, axis=0)
         metrics = calculate_metrics(val_preds, val_targets, threshold=0.5)
+        best_ep_dice = max(calculate_metrics(val_preds, val_targets, threshold=t)["dice"] for t in np.arange(0.30, 0.70, 0.05))
 
-        print(f"Epoch {epoch:02d}/{epochs:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice: {metrics['dice']:.4f} | Val IoU: {metrics['iou']:.4f}")
+        print(f"Epoch {epoch:02d}/{epochs:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice@0.5: {metrics['dice']:.4f} | BestSweep: {best_ep_dice:.4f} | IoU: {metrics['iou']:.4f}")
 
-        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, **metrics})
+        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_dice_sweep": float(best_ep_dice), **metrics})
 
-        if metrics["dice"] > best_val_dice:
-            best_val_dice = metrics["dice"]
+        if best_ep_dice > best_val_dice:
+            best_val_dice = best_ep_dice
             torch.save(model.state_dict(), os.path.join(CHECKPOINTS_DIR, "wake_net_best.pt"))
-            print(f" -> Best Wake-Net checkpoint saved (Dice: {best_val_dice:.4f})")
+            print(f" -> Best Wake-Net checkpoint saved (Sweep Dice: {best_val_dice:.4f})")
 
     print("\n[WAKE-NET EVALUATION ON UNSEEN UEIKAP TEST SET]")
     model.load_state_dict(torch.load(os.path.join(CHECKPOINTS_DIR, "wake_net_best.pt"), map_location=device))
@@ -395,6 +428,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Hybrid Wake-Net (ResNet-50 + scSE + Fast Radon)")
     parser.add_argument("--epochs", type=int, default=35)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=2e-4)
     args = parser.parse_args()
     train_wake_net(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
