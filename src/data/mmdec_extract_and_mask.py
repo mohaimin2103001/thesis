@@ -103,17 +103,21 @@ def load_satshipai_index(mmdec_dir, min_det_prob=0.35, min_ship_len=30.0):
 
 def match_ais_to_satshipai(cand_df, sat_map, max_dist_m=1200.0, stride=750):
     """
-    Matches AIS trajectories 1-to-1 to nearest unambiguous open-water SatShipAI radar detections
-    within max_dist_m (accounting for Sentinel-1 range-velocity azimuth Doppler shift).
-    Updates chunk_name and chunk-local (sat_x, sat_y) from true radar pixel (X, Y) using stride=750.
+    Refines ship coordinates by matching AIS trajectories 1-to-1 to nearest SatShipAI radar detections
+    within max_dist_m (correcting Sentinel-1 azimuth Doppler shift). Crucially retains unmatched coastal/
+    channel trajectories (with sat_matched=False -> fallback to chunk-corner homography) so sharp turns
+    near channels/ports are preserved instead of discarded.
     """
+    cand_df = cand_df.copy()
+    cand_df["sat_dist_m"] = np.nan
+    cand_df["sat_matched"] = False
+    cand_df["sat_x"] = np.nan
+    cand_df["sat_y"] = np.nan
+    cand_df["ship_length_sar"] = np.nan
+    cand_df["sat_det_prob"] = np.nan
+
     if not sat_map:
-        print("[MMDEC SATSHIPAI] SatShipAI outputs not found — falling back to raw AIS homography.")
-        cand_df = cand_df.copy()
-        cand_df["sat_dist_m"] = np.nan
-        cand_df["sat_matched"] = False
-        cand_df["sat_x"] = np.nan
-        cand_df["sat_y"] = np.nan
+        print("[MMDEC SATSHIPAI] SatShipAI outputs not found — using raw AIS homography for all ships.")
         return cand_df
 
     matches = []
@@ -142,23 +146,20 @@ def match_ais_to_satshipai(cand_df, sat_map, max_dist_m=1200.0, stride=750):
         if det_key not in best_by_det or item[1] < best_by_det[det_key][1]:
             best_by_det[det_key] = item
 
-    kept_rows = []
     for item in best_by_det.values():
         idx, best_d, _, true_chunk, sx, sy, slen, sprob = item
-        rec = cand_df.loc[idx].to_dict()
-        rec["chunk_name"] = true_chunk
-        rec["sat_dist_m"] = best_d
-        rec["sat_matched"] = True
-        rec["sat_x"] = sx
-        rec["sat_y"] = sy
-        rec["ship_length_sar"] = slen
-        rec["sat_det_prob"] = sprob
-        kept_rows.append(rec)
+        cand_df.at[idx, "chunk_name"] = true_chunk
+        cand_df.at[idx, "sat_dist_m"] = best_d
+        cand_df.at[idx, "sat_matched"] = True
+        cand_df.at[idx, "sat_x"] = sx
+        cand_df.at[idx, "sat_y"] = sy
+        cand_df.at[idx, "ship_length_sar"] = slen
+        cand_df.at[idx, "sat_det_prob"] = sprob
 
-    matched_df = pd.DataFrame(kept_rows).reset_index(drop=True)
-    print(f"[MMDEC SATSHIPAI] Confirmed 1-to-1 radar matches (<= {max_dist_m:.0f}m, len>=30m): "
-          f"{len(matched_df):,} / {len(cand_df):,} AIS trajectories.")
-    return matched_df
+    n_matched = int(cand_df["sat_matched"].sum())
+    print(f"[MMDEC SATSHIPAI] Radar-refined {n_matched:,} / {len(cand_df):,} ships (<= {max_dist_m:.0f}m); "
+          f"keeping remaining {len(cand_df) - n_matched:,} ships via homography fallback.")
+    return cand_df
 
 
 def load_corners_index(mmdec_dir):
@@ -404,7 +405,7 @@ def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop
 
 def run_mmdec_harvest_and_mask(
     min_sog=3.5,
-    min_turn_rot=1.0,
+    min_turn_rot=1.5,
     max_straight=4000,
     max_turning=-1,
     batch_size=32,
@@ -542,7 +543,7 @@ def run_mmdec_harvest_and_mask(
         imgs = []
         for p in batch_paths:
             g = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
-            g_res = preprocess_sar_logdb_clahe(g, clahe=clahe, out_size=(384, 384)).astype(np.float32) / 255.0
+            g_res = clahe.apply(cv2.resize(g, (384, 384))).astype(np.float32) / 255.0
             imgs.append(g_res)
         batch_t = torch.from_numpy(np.array(imgs)).unsqueeze(1).to(device)
 
@@ -670,7 +671,7 @@ def run_mmdec_harvest_and_mask(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MMDEC Harvester + AIS ROT + Wake-Net Auto-Masker")
     parser.add_argument("--min_sog", type=float, default=3.5)
-    parser.add_argument("--min_turn_rot", type=float, default=1.0)
+    parser.add_argument("--min_turn_rot", type=float, default=1.5)
     parser.add_argument("--max_straight", type=int, default=4000, help="-1 for all available straight ships")
     parser.add_argument("--max_turning", type=int, default=-1, help="-1 for all available turning ships")
     parser.add_argument("--batch_size", type=int, default=32)

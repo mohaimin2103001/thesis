@@ -176,8 +176,8 @@ class ConvNeXtPhysicsNet(nn.Module):
             pretrained=pretrained,
             num_classes=0,
             in_chans=3,
-            drop_rate=0.10,
-            drop_path_rate=0.10,
+            drop_rate=0.25,
+            drop_path_rate=0.25,
         )
         embed_dim = self.backbone.num_features  # 768
 
@@ -188,7 +188,7 @@ class ConvNeXtPhysicsNet(nn.Module):
             nn.Linear(num_physics_features, 64),
             nn.LayerNorm(64),
             nn.SiLU(),
-            nn.Dropout(0.10),
+            nn.Dropout(0.20),
             nn.Linear(64, 64),
             nn.SiLU()
         )
@@ -197,7 +197,7 @@ class ConvNeXtPhysicsNet(nn.Module):
             nn.Linear(embed_dim + 64, 160),
             nn.LayerNorm(160),
             nn.SiLU(),
-            nn.Dropout(0.15)
+            nn.Dropout(0.30)
         )
 
         self.binary_head = nn.Linear(160, 1)
@@ -309,20 +309,19 @@ class ScaledManeuverDataset(Dataset):
         p_orig = resolve_path(str(row.get("original_image_path", "")))
         img_p = p_crop if os.path.exists(p_crop) else p_orig
 
-        img = cv2.imread(img_p, cv2.IMREAD_GRAYSCALE)
-        if img is None:
+        bgr = cv2.imread(img_p, cv2.IMREAD_COLOR)
+        if bgr is None:
             raise FileNotFoundError(f"Could not load SAR chip for sample {row.get('sample_id')}: {img_p}")
-        img_res = cv2.resize(img, self.img_size)
+        bgr_res = cv2.resize(bgr, self.img_size)
 
-        # Fast strided percentile [p1, p99.5] in log-dB space (~160x faster than full-frame sort)
-        log_g = np.log1p(img_res.astype(np.float32))
-        lo, hi = np.percentile(log_g[::4, ::4], [1.0, 99.5])
-        if hi - lo > 1e-4:
-            log_n = np.clip((log_g - lo) / (hi - lo), 0.0, 1.0)
+        # Preserve full VV/R SAR signal in UEIKAP false-color PNGs (where green is sparse)
+        # without per-image min-max quantization stretch; MMDEC uses standard grayscale (VV+VH)/2.
+        b_ch, g_ch, r_ch = bgr_res[:, :, 0], bgr_res[:, :, 1], bgr_res[:, :, 2]
+        if float(np.mean(g_ch)) < 0.40 * float(np.mean(b_ch) + 1e-5):
+            base_u8 = np.maximum(b_ch, r_ch)
         else:
-            log_n = img_res.astype(np.float32) / 255.0
-        log_u8 = (log_n * 255.0).astype(np.uint8)
-        clahe_u8 = self.clahe.apply(log_u8)
+            base_u8 = cv2.cvtColor(bgr_res, cv2.COLOR_BGR2GRAY)
+        clahe_u8 = self.clahe.apply(base_u8)
 
         m_path = resolve_path(str(row.get("wake_mask_path", "")))
         if os.path.exists(m_path):
@@ -330,9 +329,9 @@ class ScaledManeuverDataset(Dataset):
             mask = cv2.resize(m_img, self.img_size, interpolation=cv2.INTER_NEAREST) if m_img is not None else np.zeros(self.img_size, dtype=np.uint8)
         else:
             mask = np.zeros(self.img_size, dtype=np.uint8)
-        mask_blur = cv2.GaussianBlur((mask > 127).astype(np.float32), (9, 9), 2.5)
+        mask_blur = cv2.GaussianBlur((mask > 127).astype(np.float32), (7, 7), 2.0)
         mask_u8 = np.clip(mask_blur * 255.0, 0.0, 255.0).astype(np.uint8)
-        return np.stack([log_u8, clahe_u8, mask_u8], axis=0)
+        return np.stack([base_u8, clahe_u8, mask_u8], axis=0)
 
     def __len__(self):
         return len(self.df)
@@ -346,6 +345,13 @@ class ScaledManeuverDataset(Dataset):
         rot_val = float(self.rot_values[idx])
 
         if self.augment:
+            # D4 Symmetry Group: proper 90/180/270 deg rotation preserves Turning State AND Port/Starboard chirality!
+            k_rot = int(np.random.randint(0, 4))
+            if k_rot > 0:
+                img_3ch = np.rot90(img_3ch, k_rot, axes=(1, 2)).copy()
+                phys_vec[1] = ((phys_vec[1] + 90.0 * k_rot + 180.0) % 360.0) - 180.0
+                phys_vec[10] = (phys_vec[10] + 90.0 * k_rot) % 180.0
+            # Physical horizontal mirror augmentation: swaps Port (1) <-> Starboard (2) and negates chiral physics!
             if np.random.rand() < 0.5:
                 img_3ch = img_3ch[:, :, ::-1].copy()
                 if dir_val == 1:
@@ -861,7 +867,7 @@ def train_and_predict_hgb(train_ds, eval_datasets):
     return outputs
 
 
-def run_master_suite(epochs=35, batch_size=24, lr=2e-4, img_size=320, gradcam_per_class=-1, allow_partial_data=False):
+def run_master_suite(epochs=22, batch_size=24, lr=2e-4, img_size=256, gradcam_per_class=-1, allow_partial_data=False):
     # 1. Load Expanded MMDEC+UEIKAP Dataset if present, else UEIKAP master
     expanded_path = os.path.join(DATA_DIR, "processed", "master_expanded_mmdec.parquet")
     ueikap_path = os.path.join(DATA_DIR, "processed", "maneuver_master.parquet")
@@ -910,14 +916,11 @@ def run_master_suite(epochs=35, batch_size=24, lr=2e-4, img_size=320, gradcam_pe
         features=np.array(PHYSICS_FEATURES)
     )
 
-    # Balanced sampling without extreme class-weight stacking (plus mild 1.8x boost for manual UEIKAP gold wakes)
+    # Mild class balancing without domain shortcut multiplier (prevents memorizing UEIKAP texture)
     n_st = max(1, int(np.sum(train_ds.state_labels == 0)))
     n_tu = max(1, int(np.sum(train_ds.state_labels == 1)))
     state_bal_w = float(np.clip(n_st / n_tu, 1.0, 2.5))
     sample_weights = np.where(train_ds.state_labels == 1, state_bal_w, 1.0).astype(np.float64)
-    if "source_dataset" in train_df.columns:
-        is_ueikap = (train_df["source_dataset"].values == "UEIKAP")
-        sample_weights = sample_weights * np.where(is_ueikap, 1.8, 1.0)
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(train_ds), replacement=True)
 
     # RAM-cached preprocessed uint8 dataset eliminates fork() deadlocks -> num_workers=0 runs at full GPU speed
@@ -935,16 +938,16 @@ def run_master_suite(epochs=35, batch_size=24, lr=2e-4, img_size=320, gradcam_pe
     ce_geom_dir = nn.CrossEntropyLoss(weight=torch.tensor(dir_weights, dtype=torch.float32, device=DEVICE), label_smoothing=0.05)
     bce_geom_lr = nn.BCEWithLogitsLoss()
 
-    # Decoupled optimizers: ConvNeXt (warmup + cosine) & Geometry MLP (FP32)
+    # Regularized ConvNeXt optimizer (wd=1e-2, conservative lr prevents train memorization)
     opt_cx = torch.optim.AdamW([
-        {"params": convnext_net.backbone.parameters(), "lr": lr * 0.5},
-        {"params": convnext_net.physics_mlp.parameters(), "lr": lr * 2.5},
-        {"params": convnext_net.shared_head.parameters(), "lr": lr * 2.5},
-        {"params": convnext_net.binary_head.parameters(), "lr": lr * 2.5},
-        {"params": convnext_net.direction_head.parameters(), "lr": lr * 2.5},
-        {"params": convnext_net.turn_lr_head.parameters(), "lr": lr * 2.5},
-        {"params": convnext_net.rot_head.parameters(), "lr": lr * 2.5},
-    ], weight_decay=1e-4)
+        {"params": convnext_net.backbone.parameters(), "lr": lr * 0.35},
+        {"params": convnext_net.physics_mlp.parameters(), "lr": lr},
+        {"params": convnext_net.shared_head.parameters(), "lr": lr},
+        {"params": convnext_net.binary_head.parameters(), "lr": lr},
+        {"params": convnext_net.direction_head.parameters(), "lr": lr},
+        {"params": convnext_net.turn_lr_head.parameters(), "lr": lr},
+        {"params": convnext_net.rot_head.parameters(), "lr": lr},
+    ], weight_decay=1e-2)
     warmup_epochs = min(3, max(1, epochs // 10))
 
     def _lr_lambda(ep_idx):
@@ -954,7 +957,7 @@ def run_master_suite(epochs=35, batch_size=24, lr=2e-4, img_size=320, gradcam_pe
         return max(0.01, 0.5 * (1.0 + np.cos(np.pi * progress)))
 
     sched_cx = torch.optim.lr_scheduler.LambdaLR(opt_cx, lr_lambda=_lr_lambda)
-    opt_geom = torch.optim.AdamW(geom_mlp.parameters(), lr=max(lr * 3.0, 5e-4), weight_decay=1e-4)
+    opt_geom = torch.optim.AdamW(geom_mlp.parameters(), lr=max(lr * 2.5, 4e-4), weight_decay=1e-3)
     sched_geom = torch.optim.lr_scheduler.CosineAnnealingLR(opt_geom, T_max=epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
 
@@ -979,7 +982,7 @@ def run_master_suite(epochs=35, batch_size=24, lr=2e-4, img_size=320, gradcam_pe
                 loss_cx = criterion(st_log, dir_log, rot_out, lr_log, state_t, dir_t, rot_t)
             scaler.scale(loss_cx).backward()
             scaler.unscale_(opt_cx)
-            torch.nn.utils.clip_grad_norm_(convnext_net.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(convnext_net.parameters(), max_norm=3.0)
             scaler.step(opt_cx)
             scaler.update()
 
@@ -1017,8 +1020,9 @@ def run_master_suite(epochs=35, batch_size=24, lr=2e-4, img_size=320, gradcam_pe
             val_ds.state_labels, val_ds.dir_labels, val_ds.rot_values, tau=0.50, p_stbd_cond=g_stbd
         )
 
-        cx_score = 0.45 * cx_res["balanced_accuracy"] + 0.25 * cx_res["auc_roc"] + 0.30 * cx_res["dir_3class_balanced_acc"]
-        g_score = 0.50 * g_res["balanced_accuracy"] + 0.25 * g_res["auc_roc"] + 0.25 * g_res["dir_3class_balanced_acc"]
+        # Checkpoint selection anchored on ranking AUC (prevents saving early collapsed-threshold epochs)
+        cx_score = 0.65 * cx_res["auc_roc"] + 0.35 * cx_res["balanced_accuracy"]
+        g_score = 0.65 * g_res["auc_roc"] + 0.35 * g_res["balanced_accuracy"]
 
         print(
             f"Epoch {epoch:02d}/{epochs:02d} | LossCX: {train_cx_loss:.4f} | LossG: {train_g_loss:.4f} | "
@@ -1068,10 +1072,13 @@ def run_master_suite(epochs=35, batch_size=24, lr=2e-4, img_size=320, gradcam_pe
             v_auc = float(roc_auc_score(v_st_t, v_ens)) if len(np.unique(v_st_t)) > 1 else 0.5
             for tau in np.arange(0.32, 0.74, 0.02):
                 b = (v_ens >= tau).astype(int)
+                pred_turn_frac = float(np.mean(b))
+                if pred_turn_frac < 0.10 or pred_turn_frac > 0.70:
+                    continue
                 st_a = np.mean(b[v_st_t == 0] == 0)
                 tu_a = np.mean(b[v_st_t == 1] == 1)
                 bal = 0.5 * (st_a + tu_a)
-                obj = 0.85 * bal + 0.15 * v_auc
+                obj = 0.75 * bal + 0.25 * v_auc
                 if obj > best_val_obj:
                     best_val_obj = obj
                     best_weights = (float(w_cx), float(w_mlp), float(w_hgb))
@@ -1082,24 +1089,29 @@ def run_master_suite(epochs=35, batch_size=24, lr=2e-4, img_size=320, gradcam_pe
     v_auc = float(roc_auc_score(v_st_t, v_ens)) if len(np.unique(v_st_t)) > 1 else 0.5
     v_bal = 0.5 * (np.mean((v_ens >= best_tau)[v_st_t == 0] == 0) + np.mean((v_ens >= best_tau)[v_st_t == 1] == 1))
 
-    # 2. Calibrate Port vs Starboard Mix & Threshold tau_lr Strictly on Turning Validation Samples
+    # 2. Calibrate Port vs Starboard Mix & Quantile-Balanced Threshold tau_lr on Turning Val Samples
+    # Maximizes BALANCED Port/Starboard accuracy so one direction can never collapse to 0%!
     val_cx_lr = 0.65 * val_neural["cx_lr"] + 0.35 * (val_neural["cx_dir"][:, 2] / (val_neural["cx_dir"][:, 1] + val_neural["cx_dir"][:, 2] + 1e-8))
     val_mlp_lr = val_neural["mlp_lr"]
     val_turn_m = v_st_t == 1
-    best_lr_mix, best_tau_lr, best_lr_acc = (0.75, 0.10, 0.15), 0.50, -1.0
+    best_lr_mix, best_tau_lr, best_lr_acc = (0.70, 0.10, 0.20), 0.50, -1.0
     if np.any(val_turn_m):
-        for lc in (0.60, 0.75, 0.90, 1.00):
-            for lh in (0.00, 0.15, 0.25):
+        y_lr_v = v_dir_t[val_turn_m]
+        for lc in (0.50, 0.65, 0.80, 1.00):
+            for lh in (0.00, 0.15, 0.30):
                 lm = round(1.0 - lc - lh, 2)
                 if lm < -1e-6:
                     continue
                 lm = max(0.0, lm)
-                p_lr_v = lc * val_cx_lr + lm * val_mlp_lr + lh * val_hgb["hgb_lr"]
-                for t_lr in np.arange(0.42, 0.59, 0.02):
-                    pred_lr = np.where(p_lr_v[val_turn_m] >= t_lr, 2, 1)
-                    acc_lr = float(np.mean(pred_lr == v_dir_t[val_turn_m]))
-                    if acc_lr > best_lr_acc:
-                        best_lr_acc = acc_lr
+                p_lr_v = lc * val_cx_lr[val_turn_m] + lm * val_mlp_lr[val_turn_m] + lh * val_hgb["hgb_lr"][val_turn_m]
+                cand_taus = np.quantile(p_lr_v, np.linspace(0.35, 0.65, 13))
+                for t_lr in cand_taus:
+                    pred_lr = np.where(p_lr_v >= t_lr, 2, 1)
+                    acc_p = float(np.mean(pred_lr[y_lr_v == 1] == 1)) if np.any(y_lr_v == 1) else 0.0
+                    acc_s = float(np.mean(pred_lr[y_lr_v == 2] == 2)) if np.any(y_lr_v == 2) else 0.0
+                    bal_lr = 0.5 * (acc_p + acc_s)
+                    if bal_lr > best_lr_acc:
+                        best_lr_acc = bal_lr
                         best_lr_mix = (float(lc), float(lm), float(lh))
                         best_tau_lr = float(t_lr)
 
@@ -1227,10 +1239,10 @@ def run_master_suite(epochs=35, batch_size=24, lr=2e-4, img_size=320, gradcam_pe
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Dual-Branch ConvNeXt + Lee + Geometry Ensemble")
-    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--epochs", type=int, default=22)
     parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--img_size", type=int, default=320)
+    parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--gradcam_per_class", type=int, default=-1, help="-1 generates Grad-CAM for ALL test images")
     parser.add_argument("--allow_partial_data", action="store_true", help="Allow running without full MMDEC crops")
     args = parser.parse_args()

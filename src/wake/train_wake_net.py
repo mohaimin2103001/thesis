@@ -34,19 +34,12 @@ LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 
 
 def preprocess_sar_logdb_clahe(img_gray, clahe=None, out_size=(384, 384)):
-    """Log-dB percentile SAR contrast stretch [p1, p99.5] + CLAHE normalizing dark UEIKAP & MMDEC chips."""
+    """Applies clean CLAHE normalization (avoiding per-image min-max quantization stretch)."""
     if out_size is not None and (img_gray.shape[1], img_gray.shape[0]) != tuple(out_size):
         img_gray = cv2.resize(img_gray, out_size)
-    log_g = np.log1p(img_gray.astype(np.float32))
-    lo, hi = np.percentile(log_g[::4, ::4], [1.0, 99.5])
-    if hi - lo > 1e-4:
-        stretched = np.clip((log_g - lo) / (hi - lo), 0.0, 1.0)
-    else:
-        stretched = img_gray.astype(np.float32) / 255.0
-    u8 = (stretched * 255.0).astype(np.uint8)
     if clahe is None:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(u8)
+    return clahe.apply(img_gray)
 
 
 class WakeDataset(Dataset):

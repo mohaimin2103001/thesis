@@ -69,12 +69,12 @@ print("\n" + "=" * 80)
 print("=== 5. STAGE 2: MMDEC HARVESTER + WAKE-NET AUTO-MASKING + RADON ===")
 print("=" * 80)
 # Set --max_straight -1 if you want EVERY single straight ship in MMDEC
-run_stage(["python", "-u", "-m", "src.data.mmdec_extract_and_mask", "--min_sog", "3.5", "--min_turn_rot", "1.0", "--max_straight", "4000", "--max_turning", "-1", "--batch_size", "32"])
+run_stage(["python", "-u", "-m", "src.data.mmdec_extract_and_mask", "--min_sog", "3.5", "--min_turn_rot", "1.5", "--max_straight", "4000", "--max_turning", "-1", "--batch_size", "32"])
 
 print("\n" + "=" * 80)
 print("=== 6. STAGE 3: TRAINING DUAL-BRANCH CONVNEXT + LEE + GEOMETRY ENSEMBLE ===")
 print("=" * 80)
-run_stage(["python", "-u", "kaggle/KAGGLE_MASTER_EXPANDED_SUITE.py", "--epochs", "35", "--batch_size", "24", "--lr", "2e-4", "--img_size", "320", "--gradcam_per_class", "-1"])
+run_stage(["python", "-u", "kaggle/KAGGLE_MASTER_EXPANDED_SUITE.py", "--epochs", "22", "--batch_size", "24", "--lr", "2e-4", "--img_size", "256", "--gradcam_per_class", "-1"])
 
 print("\n" + "=" * 80)
 print("=== 7. PACKAGING WEIGHTS, METRICS & GRAD-CAM VISUALS ===")
