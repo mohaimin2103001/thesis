@@ -186,6 +186,11 @@ def build_master_dataset(seed=42):
         }
 
         # Append explicit geometry attributes
+        pca_keys = (
+            "pca_span", "pca_width", "pca_abs_bend", "pca_signed_bend",
+            "pca_bend_px", "pca_lin_quad_gain", "pca_abs_defl_deg",
+            "pca_signed_defl_deg", "pca_axis_angle_deg",
+        )
         if geom_valid:
             rec.update({
                 "wake_length": geom["wake_length"],
@@ -198,7 +203,8 @@ def build_master_dataset(seed=42):
                 "wake_asymmetry": geom["wake_asymmetry"],
                 "mask_area": geom["mask_area"],
                 "geometry_confidence": geom["geometry_confidence"],
-                "branch_count": geom["branch_count"]
+                "branch_count": geom["branch_count"],
+                **{k: float(geom.get(k, 0.0)) for k in pca_keys},
             })
         else:
             rec.update({
@@ -212,7 +218,8 @@ def build_master_dataset(seed=42):
                 "wake_asymmetry": 0.0,
                 "mask_area": row["mask_area"],
                 "geometry_confidence": 0.0,
-                "branch_count": 0
+                "branch_count": 0,
+                **{k: 0.0 for k in pca_keys},
             })
 
         master_records.append(rec)

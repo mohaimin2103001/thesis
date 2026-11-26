@@ -33,14 +33,24 @@ SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from geometry.wake_geometry import extract_wake_features_from_mask
-from wake.train_wake_net import build_wake_net_model, compute_radon_wake_kinematics, preprocess_sar_logdb_clahe
+from geometry.wake_geometry import extract_wake_features_from_mask, estimate_sar_streak_angle_deg
+from wake.train_wake_net import (
+    build_wakenet_3ch,
+    compute_radon_wake_kinematics,
+    preprocess_sar_logdb_clahe,
+    extract_unified_sar_gray,
+    hysteresis_wake_mask,
+    load_wake_net_checkpoint,
+    select_high_conf_mmdec_pseudolabels,
+    adapt_wakenet_on_mmdec_pseudolabels,
+)
 
 MMDEC_DIR = os.path.join(PROJECT_ROOT, "data", "raw", "mmdec")
 PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
 INTERIM_DIR = os.path.join(PROJECT_ROOT, "data", "interim")
 MMDEC_CROPS_DIR = os.path.join(INTERIM_DIR, "mmdec_crops")
 MMDEC_MASKS_DIR = os.path.join(INTERIM_DIR, "mmdec_masks")
+WAKE_NET_3CH_CKPT = os.path.join(PROJECT_ROOT, "checkpoints", "wake_net", "wake_net_3ch_best.pt")
 WAKE_NET_CKPT = os.path.join(PROJECT_ROOT, "checkpoints", "wake_net", "wake_net_best.pt")
 WAKE_NET_EVAL = os.path.join(PROJECT_ROOT, "logs", "wake_net_evaluation.json")
 UEIKAP_MASTER = os.path.join(PROCESSED_DIR, "maneuver_master.parquet")
@@ -519,49 +529,83 @@ def run_mmdec_harvest_and_mask(
     if len(crop_df) == 0:
         raise RuntimeError("No MMDEC crops were extracted. Verify zip paths and chunk names.")
 
-    # 3. Auto-Segment Wakes with Stage-1 Trained Hybrid Wake-Net
+    # 3. Assign Strict Zero-Leakage Grouped Split (by MMSI & product_id) BEFORE Wake-Net Adaptation
+    # Guarantees pseudo-label domain adaptation uses ONLY MMDEC train crops (zero val/test contamination).
+    unique_prods = sorted(crop_df["product_id"].unique())
+    np.random.shuffle(unique_prods)
+    n_tr = int(0.70 * len(unique_prods))
+    n_va = int(0.15 * len(unique_prods))
+    tr_prods = set(unique_prods[:n_tr])
+    va_prods = set(unique_prods[n_tr:n_tr + n_va])
+    crop_df["split"] = crop_df["product_id"].apply(
+        lambda p: "train" if p in tr_prods else ("val" if p in va_prods else "test")
+    )
+    mmsi_primary_split = crop_df.groupby("mmsi")["split"].first().to_dict()
+    crop_df["split"] = crop_df["mmsi"].map(mmsi_primary_split)
+
+    # 4. Auto-Segment Wakes with Stage-1 Trained Hybrid Wake-Net + Semi-Supervised MMDEC Domain Adaptation
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    thresh = 0.50
+    ckpt_to_load = WAKE_NET_3CH_CKPT if os.path.exists(WAKE_NET_3CH_CKPT) else WAKE_NET_CKPT
+    thresh = 0.45
     if os.path.exists(WAKE_NET_EVAL):
         with open(WAKE_NET_EVAL, "r") as f:
-            thresh = float(json.load(f).get("optimal_val_threshold", 0.50))
+            thresh = float(json.load(f).get("optimal_val_threshold", 0.45))
 
-    # Use recall-friendly threshold on MMDEC JPEGs to preserve faint wake geometry
-    mmdec_thresh = min(thresh, 0.35)
-    print(f"[WAKE-NET AUTO-MASKING] Loading Wake-Net ({WAKE_NET_CKPT}) with thresh={mmdec_thresh:.2f} on {device}...")
-    wake_net = build_wake_net_model(encoder_name="resnet50", in_channels=1, classes=1, pretrained=False).to(device)
-    wake_net.load_state_dict(torch.load(WAKE_NET_CKPT, map_location=device))
-    wake_net.eval()
+    mmdec_seed_thresh = float(np.clip(thresh, 0.30, 0.45))
+    mmdec_grow_thresh = float(max(0.18, mmdec_seed_thresh * 0.58))
+    wake_net, wn_in_ch = load_wake_net_checkpoint(ckpt_to_load, device)
+    print(f"[WAKE-NET AUTO-MASKING] Loaded {os.path.basename(ckpt_to_load)} (in_ch={wn_in_ch}) "
+          f"| hysteresis=({mmdec_seed_thresh:.2f}/{mmdec_grow_thresh:.2f}) on {device}...")
 
     paths = crop_df["crop_path"].tolist()
-    mask_paths = []
-    radon_records = []
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-    for start in tqdm(range(0, len(paths), batch_size), desc="Running Wake-Net + Radon"):
-        batch_paths = paths[start:start + batch_size]
-        imgs = []
-        for p in batch_paths:
-            g = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
-            g_res = clahe.apply(cv2.resize(g, (384, 384))).astype(np.float32) / 255.0
-            imgs.append(g_res)
-        batch_t = torch.from_numpy(np.array(imgs)).unsqueeze(1).to(device)
+    def _run_wakenet_inference(net, in_ch, use_hysteresis=False, desc="Running Wake-Net"):
+        out_masks, out_radon = [], []
+        for start in tqdm(range(0, len(paths), batch_size), desc=desc):
+            batch_paths = paths[start:start + batch_size]
+            imgs = []
+            for p in batch_paths:
+                bgr = cv2.imread(p, cv2.IMREAD_COLOR)
+                if in_ch == 3:
+                    arr = build_wakenet_3ch(bgr, clahe=clahe, out_size=(384, 384)).transpose(2, 0, 1).astype(np.float32) / 255.0
+                else:
+                    g_res = preprocess_sar_logdb_clahe(bgr, clahe=clahe, out_size=(384, 384))
+                    arr = (g_res.astype(np.float32) / 255.0)[None, :, :]
+                imgs.append(arr)
+            batch_t = torch.from_numpy(np.stack(imgs, axis=0)).to(device)
+            batch_flip = torch.flip(batch_t, dims=[3])
+            with torch.no_grad():
+                p1 = torch.sigmoid(net(batch_t))
+                p2 = torch.flip(torch.sigmoid(net(batch_flip)), dims=[3])
+                probs = (0.5 * (p1 + p2)).cpu().numpy()
 
-        with torch.no_grad():
-            probs = torch.sigmoid(wake_net(batch_t)).cpu().numpy()
+            for j in range(len(batch_paths)):
+                row_idx = start + j
+                prob_map = cv2.resize(probs[j, 0], (512, 512), interpolation=cv2.INTER_LINEAR)
+                if use_hysteresis:
+                    bin_mask = hysteresis_wake_mask(prob_map, seed_thresh=mmdec_seed_thresh, grow_thresh=mmdec_grow_thresh, min_size=30)
+                else:
+                    bin_mask = ((prob_map > mmdec_seed_thresh).astype(np.uint8)) * 255
+                sid = crop_df.iloc[row_idx]["sample_id"]
+                m_path = os.path.join(MMDEC_MASKS_DIR, f"{sid}_mask.png")
+                cv2.imwrite(m_path, bin_mask)
+                out_masks.append(m_path)
+                if use_hysteresis:
+                    out_radon.append(compute_radon_wake_kinematics(bin_mask, sog_knots=crop_df.iloc[row_idx]["sog"], ship_point=(256.0, 256.0)))
+        return out_masks, out_radon
 
-        for j, p in enumerate(batch_paths):
-            row_idx = start + j
-            prob_map = cv2.resize(probs[j, 0], (512, 512), interpolation=cv2.INTER_LINEAR)
-            bin_mask = ((prob_map > mmdec_thresh).astype(np.uint8)) * 255
-
-            sid = crop_df.iloc[row_idx]["sample_id"]
-            m_path = os.path.join(MMDEC_MASKS_DIR, f"{sid}_mask.png")
-            cv2.imwrite(m_path, bin_mask)
-            mask_paths.append(m_path)
-
-            radon_res = compute_radon_wake_kinematics(bin_mask, sog_knots=crop_df.iloc[row_idx]["sog"], ship_point=(256.0, 256.0))
-            radon_records.append(radon_res)
+    if wn_in_ch == 3:
+        pass1_masks, _ = _run_wakenet_inference(wake_net, wn_in_ch, use_hysteresis=False, desc="Pass-1 Wake-Net (2x TTA)")
+        train_idx = [i for i, sp in enumerate(crop_df["split"].tolist()) if sp == "train"]
+        train_crops = [paths[i] for i in train_idx]
+        train_masks = [pass1_masks[i] for i in train_idx]
+        pseudo_pairs = select_high_conf_mmdec_pseudolabels(train_crops, train_masks, max_keep=500)
+        if len(pseudo_pairs) >= 40:
+            wake_net, _ = adapt_wakenet_on_mmdec_pseudolabels(ckpt_to_load, pseudo_pairs, epochs=8, batch_size=8, lr=1e-4, device=device)
+        mask_paths, radon_records = _run_wakenet_inference(wake_net, wn_in_ch, use_hysteresis=True, desc="Pass-2 Adapted Wake-Net + Radon")
+    else:
+        mask_paths, radon_records = _run_wakenet_inference(wake_net, wn_in_ch, use_hysteresis=True, desc="Running Wake-Net + Radon")
 
     crop_df["wake_mask_path"] = mask_paths
     crop_df["wake_mask_source"] = "WakeNet_scSE_Auto"
@@ -569,12 +613,17 @@ def run_mmdec_harvest_and_mask(
     crop_df["radon_deflection_deg"] = [r["angular_deflection_deg"] for r in radon_records]
     crop_df["radon_rot_est"] = [r["estimated_rot"] for r in radon_records]
 
-    # 4. Extract Explicit Hydrodynamic B-Spline Geometry Features
+    # 5. Extract Explicit Hydrodynamic B-Spline + PCA Quadratic Bend + SAR Streak Axis Fallback
+    pca_keys = (
+        "pca_span", "pca_width", "pca_abs_bend", "pca_signed_bend",
+        "pca_bend_px", "pca_lin_quad_gain", "pca_abs_defl_deg",
+        "pca_signed_defl_deg", "pca_axis_angle_deg",
+    )
     geom_rows = []
     for _, row in tqdm(crop_df.iterrows(), total=len(crop_df), desc="Extracting wake geometry"):
         geom = extract_wake_features_from_mask(row["wake_mask_path"], ship_point=(256.0, 256.0))
         if geom is not None:
-            geom_rows.append({
+            rec_g = {
                 "geometry_valid": True,
                 "wake_length": geom["wake_length"],
                 "wake_orientation": geom["wake_orientation"],
@@ -587,13 +636,18 @@ def run_mmdec_harvest_and_mask(
                 "mask_area": geom["mask_area"],
                 "geometry_confidence": geom["geometry_confidence"],
                 "branch_count": geom["branch_count"],
-                "label_quality": "AIS-AutoWake-A"
-            })
+                "img_axis_angle_deg": float(geom["pca_axis_angle_deg"]),
+                "label_quality": "AIS-AutoWake-A",
+                **{k: float(geom.get(k, 0.0)) for k in pca_keys},
+            }
         else:
-            geom_rows.append({
+            bgr = cv2.imread(row["crop_path"], cv2.IMREAD_COLOR)
+            sar_g = extract_unified_sar_gray(bgr) if bgr is not None else None
+            fallback_ang = estimate_sar_streak_angle_deg(sar_g, ship_point=(256.0, 256.0))
+            rec_g = {
                 "geometry_valid": False,
                 "wake_length": 0.0,
-                "wake_orientation": row["radon_angle_deg"],
+                "wake_orientation": fallback_ang,
                 "mean_curvature": 0.0,
                 "median_curvature": 0.0,
                 "max_abs_curvature": 0.0,
@@ -603,55 +657,51 @@ def run_mmdec_harvest_and_mask(
                 "mask_area": 0,
                 "geometry_confidence": 0.0,
                 "branch_count": 0,
-                "label_quality": "AIS-AutoWake-Low"
-            })
+                "img_axis_angle_deg": fallback_ang,
+                "label_quality": "AIS-AutoWake-Low",
+                **{k: 0.0 for k in pca_keys},
+            }
+            rec_g["pca_axis_angle_deg"] = fallback_ang
+        geom_rows.append(rec_g)
 
     geom_df = pd.DataFrame(geom_rows)
     mmdec_final = pd.concat([crop_df.reset_index(drop=True), geom_df], axis=1)
 
-    # Keep ALL AIS-verified ships (retain faint-wake crops for ConvNeXt instead of discarding 47%!)
     confirmed_n = int((mmdec_final["mask_area"] >= 50).sum())
-    print(f"[MMDEC WAKE COVERAGE] {confirmed_n:,} / {len(mmdec_final):,} ships have strong masks (>=50 px); retaining all {len(mmdec_final):,} verified ships.")
+    print(f"[MMDEC WAKE COVERAGE] {confirmed_n:,} / {len(mmdec_final):,} ships ({confirmed_n/max(1,len(mmdec_final))*100:.1f}%) have strong masks (>=50 px); retaining all {len(mmdec_final):,} verified ships.")
 
-    # 5. Strict Zero-Leakage Grouped Split (by MMSI & product_id)
-    unique_prods = sorted(mmdec_final["product_id"].unique())
-    np.random.shuffle(unique_prods)
-    n_tr = int(0.70 * len(unique_prods))
-    n_va = int(0.15 * len(unique_prods))
-
-    tr_prods = set(unique_prods[:n_tr])
-    va_prods = set(unique_prods[n_tr:n_tr + n_va])
-    te_prods = set(unique_prods[n_tr + n_va:])
-
-    # Assign split by product, then purge any MMSI crossing splits to guarantee zero vessel leakage
-    mmdec_final["split"] = mmdec_final["product_id"].apply(
-        lambda p: "train" if p in tr_prods else ("val" if p in va_prods else "test")
-    )
-    mmsi_primary_split = mmdec_final.groupby("mmsi")["split"].first().to_dict()
-    mmdec_final["split"] = mmdec_final["mmsi"].map(mmsi_primary_split)
-
-    # 6. Merge with Original UEIKAP maneuver_master.parquet & compute real Radon features for UEIKAP!
+    # 6. Merge with Original UEIKAP maneuver_master.parquet & compute Radon + PCA features for UEIKAP!
     if os.path.exists(UEIKAP_MASTER):
         ueikap_df = pd.read_parquet(UEIKAP_MASTER)
         u_angles, u_defls, u_rots = [], [], []
-        for _, ur in tqdm(ueikap_df.iterrows(), total=len(ueikap_df), desc="Computing UEIKAP Radon"):
+        u_pca_rows = []
+        for _, ur in tqdm(ueikap_df.iterrows(), total=len(ueikap_df), desc="Computing UEIKAP Radon & PCA"):
             mp = str(ur.get("wake_mask_path", "")).replace("\\", "/")
             if not os.path.exists(mp):
                 mp = os.path.join(PROJECT_ROOT, "data", "interim", "ueikap_masks", os.path.basename(mp))
+            sp = (float(ur["ship_x"]), float(ur["ship_y"])) if pd.notna(ur.get("ship_x", np.nan)) else (256.0, 256.0)
             if os.path.exists(mp):
                 um = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
-                sp = (float(ur["ship_x"]), float(ur["ship_y"])) if pd.notna(ur.get("ship_x", np.nan)) else (256.0, 256.0)
                 kr = compute_radon_wake_kinematics((um > 127).astype(np.uint8) * 255, sog_knots=ur.get("sog", None), ship_point=sp)
                 u_angles.append(kr["dominant_angle_deg"])
                 u_defls.append(kr["angular_deflection_deg"])
                 u_rots.append(kr["estimated_rot"])
+                ug = extract_wake_features_from_mask(mp, ship_point=sp) or {}
+                u_pca = {k: float(ug.get(k, 0.0)) for k in pca_keys}
+                u_pca["img_axis_angle_deg"] = float(ug.get("pca_axis_angle_deg", kr["dominant_angle_deg"]))
             else:
                 u_angles.append(0.0)
                 u_defls.append(0.0)
                 u_rots.append(0.0)
+                u_pca = {k: 0.0 for k in pca_keys}
+                u_pca["img_axis_angle_deg"] = -90.0
+            u_pca_rows.append(u_pca)
         ueikap_df["radon_angle_deg"] = u_angles
         ueikap_df["radon_deflection_deg"] = u_defls
         ueikap_df["radon_rot_est"] = u_rots
+        u_pca_df = pd.DataFrame(u_pca_rows)
+        for col in u_pca_df.columns:
+            ueikap_df[col] = u_pca_df[col].values
         common_cols = [c for c in ueikap_df.columns if c in mmdec_final.columns]
         combined_df = pd.concat([ueikap_df[common_cols], mmdec_final[common_cols]], ignore_index=True)
     else:

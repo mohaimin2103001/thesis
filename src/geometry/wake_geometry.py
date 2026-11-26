@@ -4,6 +4,8 @@ Performs morphological skeletonization, smooth spline fitting, analytical signed
 and canonical ship-frame orientation for physical maneuver inference.
 """
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 import numpy as np
 from scipy import interpolate
 from scipy.ndimage import distance_transform_edt
@@ -156,9 +158,128 @@ def compute_signed_curvature_profile(ordered_pts, num_eval_points=100, smoothing
         return None
 
 
+def compute_pca_bend_features(bool_mask, ship_point=None, num_slices=16):
+    """
+    Gap-tolerant hydrodynamic wake geometry via oriented PCA frame and slice-median centerline fitting.
+    Projects foreground wake pixels onto principal wake axis u (pointing ship -> tail) and normal v,
+    then fits linear and quadratic profiles across u-slices to quantify curvature even across broken masks.
+    """
+    ys, xs = np.where(bool_mask)
+    if len(xs) < 25:
+        return None
+
+    pts = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
+    mean_pt = pts.mean(axis=0)
+    centered = pts - mean_pt
+    cov = np.cov(centered.T) if len(pts) > 2 else np.eye(2)
+    evals, evecs = np.linalg.eigh(cov)
+    axis = evecs[:, int(np.argmax(evals))]
+
+    h, w = bool_mask.shape
+    sp = np.array([w * 0.5, h * 0.5], dtype=np.float64) if ship_point is None else np.array(ship_point, dtype=np.float64)
+    if np.dot(mean_pt - sp, axis) < 0.0:
+        axis = -axis
+
+    ortho = np.array([-axis[1], axis[0]], dtype=np.float64)
+    rel = pts - sp
+    u_c = rel @ axis
+    v_c = rel @ ortho
+
+    u_low, u_high = np.percentile(u_c, [2, 98])
+    u_span = max(10.0, float(u_high - u_low))
+    wake_width = float(np.percentile(v_c, 90) - np.percentile(v_c, 10))
+    axis_angle_deg = float(np.degrees(np.arctan2(axis[1], axis[0])))
+
+    # Track slice-median centerline along u so Kelvin V-arms don't bias centroid curvature
+    edges = np.linspace(u_low, u_high, num_slices + 1)
+    uc_m, vc_m = [], []
+    for i in range(num_slices):
+        in_slice = (u_c >= edges[i]) & (u_c <= edges[i + 1])
+        if np.sum(in_slice) >= 3:
+            uc_m.append(0.5 * (edges[i] + edges[i + 1]))
+            vc_m.append(float(np.median(v_c[in_slice])))
+
+    if len(uc_m) < 5:
+        uc_m = u_c
+        vc_m = v_c
+    else:
+        uc_m = np.asarray(uc_m, dtype=np.float64)
+        vc_m = np.asarray(vc_m, dtype=np.float64)
+
+    u_norm = (uc_m - uc_m.mean()) / (0.5 * u_span)
+    c_lin = np.polyfit(u_norm, vc_m, 1)
+    rmse_lin = float(np.sqrt(np.mean((vc_m - np.polyval(c_lin, u_norm)) ** 2)))
+    c_quad = np.polyfit(u_norm, vc_m, 2)
+    rmse_quad = float(np.sqrt(np.mean((vc_m - np.polyval(c_quad, u_norm)) ** 2)))
+
+    a2 = float(c_quad[0])  # sagitta deflection in px over normalized [-1, 1] wake span
+    lin_quad_gain = max(0.0, (rmse_lin - rmse_quad) / (rmse_lin + 1e-4))
+
+    u_med = float(np.median(uc_m))
+    head = uc_m <= u_med
+    tail = uc_m > u_med
+    slope_h = float(np.polyfit(uc_m[head], vc_m[head], 1)[0]) if np.sum(head) >= 3 else 0.0
+    slope_t = float(np.polyfit(uc_m[tail], vc_m[tail], 1)[0]) if np.sum(tail) >= 3 else 0.0
+    pca_defl_deg = float(np.degrees(np.arctan(slope_t) - np.arctan(slope_h)))
+
+    return {
+        "pca_span": u_span,
+        "pca_width": wake_width,
+        "pca_abs_bend": abs(a2) / (u_span + 1.0),
+        "pca_signed_bend": a2 / (u_span + 1.0),
+        "pca_bend_px": abs(a2),
+        "pca_lin_quad_gain": lin_quad_gain,
+        "pca_abs_defl_deg": abs(pca_defl_deg),
+        "pca_signed_defl_deg": pca_defl_deg,
+        "pca_axis_angle_deg": axis_angle_deg,
+    }
+
+
+def estimate_sar_streak_angle_deg(sar_gray, ship_point=None):
+    """
+    Fallback canonical wake axis estimator directly from SAR intensity anomalies around ship center
+    when the Wake-Net segmentation mask is too sparse (< 50 px) for PCA mask fitting.
+    Returns an oriented angle in (-180, 180] pointing along the highest-contrast streak half.
+    """
+    if sar_gray is None or sar_gray.size == 0:
+        return -90.0
+    h, w = sar_gray.shape[:2]
+    sp_x, sp_y = (w * 0.5, h * 0.5) if ship_point is None else ship_point
+
+    f_img = sar_gray.astype(np.float32)
+    bg = cv2.GaussianBlur(f_img, (31, 31), 0)
+    anom = np.abs(f_img - bg)
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    dx = xx.astype(np.float32) - float(sp_x)
+    dy = yy.astype(np.float32) - float(sp_y)
+    r = np.hypot(dx, dy)
+    # Exclude bright ship hull center (r < 12px) and border margin
+    ring = (r >= 12.0) & (r <= 0.45 * min(h, w))
+    weights = anom * ring.astype(np.float32)
+    thr = float(np.percentile(weights[ring], 88)) if np.any(ring) else 0.0
+    sel = weights >= max(thr, 1e-3)
+    if np.sum(sel) < 25:
+        return -90.0
+
+    pts = np.column_stack([xx[sel].astype(np.float64), yy[sel].astype(np.float64)])
+    w_pts = weights[sel].astype(np.float64)
+    w_sum = float(np.sum(w_pts)) + 1e-8
+    mean_pt = (pts * w_pts[:, None]).sum(axis=0) / w_sum
+    centered = pts - mean_pt
+    cov = (centered * w_pts[:, None]).T @ centered / w_sum
+    evals, evecs = np.linalg.eigh(cov)
+    axis = evecs[:, int(np.argmax(evals))]
+    if np.dot(mean_pt - np.array([sp_x, sp_y]), axis) < 0.0:
+        axis = -axis
+    return float(np.degrees(np.arctan2(axis[1], axis[0])))
+
+
 def extract_wake_features_from_mask(mask_path, ship_point=None):
     """
     High-level end-to-end extractor from a binary wake mask file to explicit geometry dictionary.
+    Always computes gap-tolerant PCA quadratic bend descriptors whenever mask_area >= 50 px,
+    even if skeletonization fragments.
     """
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
@@ -169,16 +290,34 @@ def extract_wake_features_from_mask(mask_path, ship_point=None):
         return None
 
     cleaned = clean_wake_mask(mask)
+    pca_feats = compute_pca_bend_features(cleaned > 127, ship_point=ship_point)
     centerline_pts, branch_count, conf = extract_ordered_centerline(cleaned, ship_point=ship_point)
 
-    if centerline_pts is None:
-        return None
-
-    geom = compute_signed_curvature_profile(centerline_pts)
+    geom = compute_signed_curvature_profile(centerline_pts) if centerline_pts is not None else None
     if geom is None:
-        return None
+        if pca_feats is None:
+            return None
+        geom = {
+            "wake_length": float(pca_feats["pca_span"]),
+            "wake_orientation": float(pca_feats["pca_axis_angle_deg"]),
+            "mean_curvature": float(pca_feats["pca_abs_bend"]),
+            "median_curvature": float(pca_feats["pca_abs_bend"]),
+            "max_abs_curvature": float(pca_feats["pca_abs_bend"]),
+            "signed_mean_curvature": float(pca_feats["pca_signed_bend"]),
+            "curvature_std": 0.0,
+            "wake_asymmetry": float(pca_feats["pca_signed_bend"] * 0.5),
+        }
 
     geom["mask_area"] = mask_area
-    geom["geometry_confidence"] = conf
-    geom["branch_count"] = branch_count
+    geom["geometry_confidence"] = float(conf) if conf > 0 else 0.25
+    geom["branch_count"] = int(branch_count)
+    if pca_feats is not None:
+        geom.update(pca_feats)
+    else:
+        for k in (
+            "pca_span", "pca_width", "pca_abs_bend", "pca_signed_bend",
+            "pca_bend_px", "pca_lin_quad_gain", "pca_abs_defl_deg",
+            "pca_signed_defl_deg", "pca_axis_angle_deg",
+        ):
+            geom[k] = 0.0
     return geom
