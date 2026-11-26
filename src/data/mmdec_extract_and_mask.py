@@ -108,7 +108,7 @@ def latlon_to_chunk_pixel(lat, lon, corner_row, chunk_size=800):
     return float(px[0]), float(px[1])
 
 
-def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=180):
+def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=600):
     """
     1. Finds all AIS pings synchronized to a Sentinel-1 overpass (chunk_folder != null).
     2. Loads +-window_sec AIS trajectory for each matched MMSI to compute unwrapped d(COG)/dt (deg/min).
@@ -182,10 +182,10 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=180):
                 rot_deg_min = float(np.polyfit(dt_min, unwrapped_deg, 1)[0])
                 delta_cog = float(abs(unwrapped_deg[-1] - unwrapped_deg[0]))
 
-        # Fallback to ITU-R M.1371 RateOfTurn sensor decoding if sparse satellite AIS pings
+        # Fallback to ITU-R M.1371 RateOfTurn sensor decoding (including 0.0 for straight cruising!)
         if rot_deg_min is None:
-            if -126.0 <= raw_rot <= 126.0 and raw_rot != 0.0:
-                rot_deg_min = float(np.sign(raw_rot) * ((abs(raw_rot) / 4.733) ** 2))
+            if -126.0 <= raw_rot <= 126.0:
+                rot_deg_min = float(np.sign(raw_rot) * ((abs(raw_rot) / 4.733) ** 2)) if raw_rot != 0.0 else 0.0
                 delta_cog = abs(rot_deg_min) * 2.0
             else:
                 continue
@@ -392,7 +392,9 @@ def run_mmdec_harvest_and_mask(
         with open(WAKE_NET_EVAL, "r") as f:
             thresh = float(json.load(f).get("optimal_val_threshold", 0.50))
 
-    print(f"[WAKE-NET AUTO-MASKING] Loading Wake-Net ({WAKE_NET_CKPT}) with thresh={thresh:.2f} on {device}...")
+    # Use recall-friendly threshold on MMDEC JPEGs to preserve faint wake geometry
+    mmdec_thresh = min(thresh, 0.35)
+    print(f"[WAKE-NET AUTO-MASKING] Loading Wake-Net ({WAKE_NET_CKPT}) with thresh={mmdec_thresh:.2f} on {device}...")
     wake_net = build_wake_net_model(encoder_name="resnet50", in_channels=1, classes=1, pretrained=False).to(device)
     wake_net.load_state_dict(torch.load(WAKE_NET_CKPT, map_location=device))
     wake_net.eval()
@@ -417,7 +419,7 @@ def run_mmdec_harvest_and_mask(
         for j, p in enumerate(batch_paths):
             row_idx = start + j
             prob_map = cv2.resize(probs[j, 0], (512, 512), interpolation=cv2.INTER_LINEAR)
-            bin_mask = ((prob_map > thresh).astype(np.uint8)) * 255
+            bin_mask = ((prob_map > mmdec_thresh).astype(np.uint8)) * 255
 
             sid = crop_df.iloc[row_idx]["sample_id"]
             m_path = os.path.join(MMDEC_MASKS_DIR, f"{sid}_mask.png")
@@ -473,10 +475,9 @@ def run_mmdec_harvest_and_mask(
     geom_df = pd.DataFrame(geom_rows)
     mmdec_final = pd.concat([crop_df.reset_index(drop=True), geom_df], axis=1)
 
-    # Keep only vessels with detectable wake masks (filter open-water blank masks)
-    before_n = len(mmdec_final)
-    mmdec_final = mmdec_final[mmdec_final["mask_area"] >= 50].reset_index(drop=True)
-    print(f"[MMDEC QUALITY FILTER] Retained {len(mmdec_final):,} / {before_n:,} ships with confirmed wake masks.")
+    # Keep ALL AIS-verified ships (retain faint-wake crops for ConvNeXt instead of discarding 47%!)
+    confirmed_n = int((mmdec_final["mask_area"] >= 50).sum())
+    print(f"[MMDEC WAKE COVERAGE] {confirmed_n:,} / {len(mmdec_final):,} ships have strong masks (>=50 px); retaining all {len(mmdec_final):,} verified ships.")
 
     # 5. Strict Zero-Leakage Grouped Split (by MMSI & product_id)
     unique_prods = sorted(mmdec_final["product_id"].unique())
@@ -495,12 +496,27 @@ def run_mmdec_harvest_and_mask(
     mmsi_primary_split = mmdec_final.groupby("mmsi")["split"].first().to_dict()
     mmdec_final["split"] = mmdec_final["mmsi"].map(mmsi_primary_split)
 
-    # 6. Merge with Original UEIKAP maneuver_master.parquet (Preserving UEIKAP splits!)
+    # 6. Merge with Original UEIKAP maneuver_master.parquet & compute real Radon features for UEIKAP!
     if os.path.exists(UEIKAP_MASTER):
         ueikap_df = pd.read_parquet(UEIKAP_MASTER)
-        for col in ["radon_angle_deg", "radon_deflection_deg", "radon_rot_est"]:
-            if col not in ueikap_df.columns:
-                ueikap_df[col] = 0.0
+        u_angles, u_defls, u_rots = [], [], []
+        for _, ur in tqdm(ueikap_df.iterrows(), total=len(ueikap_df), desc="Computing UEIKAP Radon"):
+            mp = str(ur.get("wake_mask_path", "")).replace("\\", "/")
+            if not os.path.exists(mp):
+                mp = os.path.join(PROJECT_ROOT, "data", "interim", "ueikap_masks", os.path.basename(mp))
+            if os.path.exists(mp):
+                um = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
+                kr = compute_radon_wake_kinematics((um > 127).astype(np.uint8) * 255, sog_knots=ur.get("sog", None))
+                u_angles.append(kr["dominant_angle_deg"])
+                u_defls.append(kr["angular_deflection_deg"])
+                u_rots.append(kr["estimated_rot"])
+            else:
+                u_angles.append(0.0)
+                u_defls.append(0.0)
+                u_rots.append(0.0)
+        ueikap_df["radon_angle_deg"] = u_angles
+        ueikap_df["radon_deflection_deg"] = u_defls
+        ueikap_df["radon_rot_est"] = u_rots
         common_cols = [c for c in ueikap_df.columns if c in mmdec_final.columns]
         combined_df = pd.concat([ueikap_df[common_cols], mmdec_final[common_cols]], ignore_index=True)
     else:

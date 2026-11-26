@@ -163,8 +163,13 @@ class ConvNeXtPhysicsNet(nn.Module):
         self.rot_head = nn.Linear(160, 1)
 
     def forward(self, x_img, x_phys):
-        filt = self.speckle_filter(x_img)
-        x_3ch = (filt.repeat(1, 3, 1, 1) - self.img_mean) / self.img_std
+        # x_img: (B, 2, H, W) -> Ch 0 = SAR grayscale, Ch 1 = Wake-Net Mask
+        sar_ch = x_img[:, 0:1]
+        mask_ch = x_img[:, 1:2]
+        lee_ch = self.speckle_filter(sar_ch)
+        # 3-channel physics-guided tensor: [Lee-filtered SAR, Contrast SAR, Wake Mask Spotlight]
+        x_raw3 = torch.cat([lee_ch, sar_ch, mask_ch], dim=1)
+        x_3ch = (x_raw3 - self.img_mean) / self.img_std
         v_emb = self.backbone(x_3ch)
         p_emb = self.physics_mlp(x_phys)
         feat = self.shared_head(torch.cat([v_emb, p_emb], dim=1))
@@ -216,10 +221,12 @@ class ScaledManeuverDataset(Dataset):
         else:
             self.phys_mean = phys_mean
             self.phys_std = phys_std
+        self.phys_raw = phys_raw
         self.phys_norm = np.clip((phys_raw - self.phys_mean) / self.phys_std, -8.0, 8.0)
 
-        geom_indices = [PHYSICS_FEATURES.index(c) for c in GEOMETRY_FEATURES]
-        self.geom_norm = self.phys_norm[:, geom_indices]
+        self.geom_indices = [PHYSICS_FEATURES.index(c) for c in GEOMETRY_FEATURES]
+        self.geom_norm = self.phys_norm[:, self.geom_indices]
+        self.chiral_indices = [PHYSICS_FEATURES.index(c) for c in ["signed_mean_curvature", "wake_asymmetry", "radon_deflection_deg"]]
 
         # Resolve ground-truth labels cleanly across both UEIKAP ('state', 'rot_target') and any alias
         state_col = "state" if "state" in self.df.columns else "maneuver_state"
@@ -247,21 +254,46 @@ class ScaledManeuverDataset(Dataset):
         img = cv2.imread(img_p, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise FileNotFoundError(f"Could not load SAR chip for sample {row.get('sample_id')}: {img_p}")
-        img = cv2.resize(img, self.img_size)
-        img = self.clahe.apply(img)
+        img = self.clahe.apply(cv2.resize(img, self.img_size))
 
-        # Careful augmentation: horizontal flip mirrors Port <-> Starboard, so ONLY apply rotation-preserving
-        # contrast/intensity jitter or explicit mirrored label flip! Here we keep geometry orientation exact.
-        if self.augment and np.random.rand() < 0.4:
-            gamma = np.random.uniform(0.90, 1.10)
-            img = np.clip(img.astype(np.float32) * gamma, 0, 255).astype(np.uint8)
+        # Load Wake-Net / GT segmented wake mask as 2nd channel spotlight
+        m_path = resolve_path(str(row.get("wake_mask_path", "")))
+        if os.path.exists(m_path):
+            m_img = cv2.imread(m_path, cv2.IMREAD_GRAYSCALE)
+            mask = cv2.resize(m_img, self.img_size, interpolation=cv2.INTER_NEAREST) if m_img is not None else np.zeros(self.img_size, dtype=np.uint8)
+        else:
+            mask = np.zeros(self.img_size, dtype=np.uint8)
 
-        img_t = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
-        phys_t = torch.from_numpy(self.phys_norm[idx].astype(np.float32))
-        geom_t = torch.from_numpy(self.geom_norm[idx].astype(np.float32))
+        phys_vec = self.phys_raw[idx].copy()
+        dir_val = int(self.dir_labels[idx])
+        rot_val = float(self.rot_values[idx])
+
+        if self.augment:
+            # Physical horizontal mirror augmentation: swaps Port (1) <-> Starboard (2) and negates chiral physics!
+            if np.random.rand() < 0.5:
+                img = np.fliplr(img).copy()
+                mask = np.fliplr(mask).copy()
+                if dir_val == 1:
+                    dir_val = 2
+                elif dir_val == 2:
+                    dir_val = 1
+                rot_val = -rot_val
+                for ci in self.chiral_indices:
+                    phys_vec[ci] = -phys_vec[ci]
+            if np.random.rand() < 0.4:
+                gamma = np.random.uniform(0.90, 1.10)
+                img = np.clip(img.astype(np.float32) * gamma, 0, 255).astype(np.uint8)
+
+        phys_norm_vec = np.clip((phys_vec - self.phys_mean) / self.phys_std, -8.0, 8.0).astype(np.float32)
+        geom_norm_vec = phys_norm_vec[self.geom_indices]
+
+        img_2ch = np.stack([img.astype(np.float32) / 255.0, (mask > 127).astype(np.float32)], axis=0)
+        img_t = torch.from_numpy(img_2ch)
+        phys_t = torch.from_numpy(phys_norm_vec)
+        geom_t = torch.from_numpy(geom_norm_vec)
         state_t = torch.tensor(self.state_labels[idx], dtype=torch.float32)
-        dir_t = torch.tensor(self.dir_labels[idx], dtype=torch.long)
-        rot_t = torch.tensor(self.rot_values[idx], dtype=torch.float32)
+        dir_t = torch.tensor(dir_val, dtype=torch.long)
+        rot_t = torch.tensor(rot_val, dtype=torch.float32)
 
         return img_t, phys_t, geom_t, state_t, dir_t, rot_t
 
@@ -270,14 +302,13 @@ class ScaledManeuverDataset(Dataset):
 # Physics-Informed Multi-Task Loss
 # --------------------------------------------------------------------------------------------------
 class PhysicsInformedMultiTaskLoss(nn.Module):
-    def __init__(self, pos_weight=2.0, dir_weights=None, lambda_dir=0.35, lambda_rot=0.15, lambda_phys=0.05):
+    def __init__(self, pos_weight=2.0, dir_weights=None, lambda_dir=0.45, lambda_rot=0.45, lambda_phys=0.05):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=DEVICE))
         if dir_weights is not None:
             self.ce_dir = nn.CrossEntropyLoss(weight=torch.tensor(dir_weights, dtype=torch.float32, device=DEVICE), label_smoothing=0.05)
         else:
             self.ce_dir = nn.CrossEntropyLoss(label_smoothing=0.05)
-        self.huber_rot = nn.SmoothL1Loss(beta=1.0)
         self.lambda_dir = lambda_dir
         self.lambda_rot = lambda_rot
         self.lambda_phys = lambda_phys
@@ -285,13 +316,11 @@ class PhysicsInformedMultiTaskLoss(nn.Module):
     def forward(self, state_logit, dir_logits, rot_pred, state_t, dir_t, rot_t, signed_curv):
         l_state = self.bce(state_logit, state_t)
         l_dir = self.ce_dir(dir_logits, dir_t)
-        l_rot = self.huber_rot(rot_pred, rot_t)
-
-        # Physics consistency: Straight vessels (|kappa| near 0) penalized for large |ROT|
-        # and sign(ROT) constrained to correlate with signed wake curvature when |kappa| is significant
-        zero_turn_penalty = torch.mean((1.0 - state_t) * torch.abs(rot_pred))
-        l_phys = zero_turn_penalty
-
+        # Weight turning vessels 3x in signed ROT regression so turning magnitude is learned cleanly
+        rot_weights = 1.0 + 3.0 * state_t
+        l_rot = torch.mean(rot_weights * F.smooth_l1_loss(rot_pred, rot_t, reduction="none", beta=1.0))
+        # Light sign-coherence constraint on turning vessels
+        l_phys = torch.mean(state_t * torch.relu(-rot_pred * torch.sign(rot_t)))
         return l_state + self.lambda_dir * l_dir + self.lambda_rot * l_rot + self.lambda_phys * l_phys
 
 
@@ -382,7 +411,7 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=-1
         x_phys = phys_t.unsqueeze(0).to(DEVICE)
 
         with torch.no_grad():
-            lee_img = convnext_net.speckle_filter(x_img).squeeze().cpu().numpy()
+            lee_img = convnext_net.speckle_filter(x_img[:, 0:1]).squeeze().cpu().numpy()
 
         st_logit, dir_logits, rot_pred = convnext_net(x_img, x_phys)
         convnext_net.zero_grad()
@@ -413,7 +442,7 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=-1
                     total_e = float(np.sum(cam_res)) + 1e-8
                     wake_energy_ratio = float(np.sum(cam_res[mask_bin]) / total_e)
 
-        raw_np = img_t.squeeze().numpy()
+        raw_np = img_t[0].numpy()
         fig, axes = plt.subplots(1, 3, figsize=(12, 4))
         axes[0].imshow(raw_np, cmap="gray")
         axes[0].set_title(f"Raw SAR ({row.get('source_dataset', 'SAR')})")
@@ -532,14 +561,12 @@ def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base
     geom_indices = [PHYSICS_FEATURES.index(c) for c in GEOMETRY_FEATURES]
     imp_rows = []
 
-    orig_phys = test_ds.phys_norm.copy()
-    orig_geom = test_ds.geom_norm.copy()
+    orig_phys_raw = test_ds.phys_raw.copy()
 
     for f_idx, fname in enumerate(PHYSICS_FEATURES):
-        perm_phys = orig_phys.copy()
-        perm_phys[:, f_idx] = np.random.permutation(perm_phys[:, f_idx])
-        test_ds.phys_norm = perm_phys
-        test_ds.geom_norm = perm_phys[:, geom_indices]
+        perm_raw = orig_phys_raw.copy()
+        perm_raw[:, f_idx] = np.random.permutation(perm_raw[:, f_idx])
+        test_ds.phys_raw = perm_raw
 
         loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
         p_all = []
@@ -555,8 +582,7 @@ def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base
         bal = 0.5 * (st_acc + tu_acc)
         imp_rows.append({"feature": fname, "permuted_bal_acc": float(bal), "importance_drop": float(base_bal_acc - bal)})
 
-    test_ds.phys_norm = orig_phys
-    test_ds.geom_norm = orig_geom
+    test_ds.phys_raw = orig_phys_raw
 
     imp_df = pd.DataFrame(imp_rows).sort_values("importance_drop", ascending=False)
     imp_df.to_csv(os.path.join(TABLES_DIR, "convnext_physics_feature_importance.csv"), index=False)
@@ -859,7 +885,7 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Dual-Branch ConvNeXt + Lee + Geometry Ensemble")
-    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--epochs", type=int, default=35)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--gradcam_per_class", type=int, default=-1, help="-1 generates Grad-CAM for ALL test images")
