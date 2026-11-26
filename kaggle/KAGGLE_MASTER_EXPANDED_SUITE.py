@@ -129,13 +129,24 @@ class ConvNeXtPhysicsNet(nn.Module):
     def __init__(self, num_physics_features=12, pretrained=True):
         super().__init__()
         self.speckle_filter = LeeSpeckleFilter(kernel_size=7, noise_var=0.08)
-        self.backbone = timm.create_model("convnext_tiny", pretrained=pretrained, num_classes=0, in_chans=3)
+        self.backbone = timm.create_model(
+            "convnext_tiny",
+            pretrained=pretrained,
+            num_classes=0,
+            in_chans=3,
+            drop_rate=0.25,
+            drop_path_rate=0.20,
+        )
         embed_dim = self.backbone.num_features  # 768
+
+        self.register_buffer("img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self.physics_mlp = nn.Sequential(
             nn.Linear(num_physics_features, 64),
             nn.BatchNorm1d(64),
             nn.SiLU(),
+            nn.Dropout(0.20),
             nn.Linear(64, 64),
             nn.SiLU()
         )
@@ -153,7 +164,7 @@ class ConvNeXtPhysicsNet(nn.Module):
 
     def forward(self, x_img, x_phys):
         filt = self.speckle_filter(x_img)
-        x_3ch = filt.repeat(1, 3, 1, 1)
+        x_3ch = (filt.repeat(1, 3, 1, 1) - self.img_mean) / self.img_std
         v_emb = self.backbone(x_3ch)
         p_emb = self.physics_mlp(x_phys)
         feat = self.shared_head(torch.cat([v_emb, p_emb], dim=1))
@@ -191,6 +202,7 @@ class ScaledManeuverDataset(Dataset):
         self.df = df.reset_index(drop=True)
         self.img_size = img_size
         self.augment = augment
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
         for col in PHYSICS_FEATURES:
             if col not in self.df.columns:
@@ -236,6 +248,7 @@ class ScaledManeuverDataset(Dataset):
         if img is None:
             raise FileNotFoundError(f"Could not load SAR chip for sample {row.get('sample_id')}: {img_p}")
         img = cv2.resize(img, self.img_size)
+        img = self.clahe.apply(img)
 
         # Careful augmentation: horizontal flip mirrors Port <-> Starboard, so ONLY apply rotation-preserving
         # contrast/intensity jitter or explicit mirrored label flip! Here we keep geometry orientation exact.
@@ -257,7 +270,7 @@ class ScaledManeuverDataset(Dataset):
 # Physics-Informed Multi-Task Loss
 # --------------------------------------------------------------------------------------------------
 class PhysicsInformedMultiTaskLoss(nn.Module):
-    def __init__(self, pos_weight=2.0, dir_weights=None, lambda_dir=0.6, lambda_rot=0.25, lambda_phys=0.15):
+    def __init__(self, pos_weight=2.0, dir_weights=None, lambda_dir=0.35, lambda_rot=0.15, lambda_phys=0.05):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=DEVICE))
         if dir_weights is not None:
@@ -436,7 +449,7 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=-1
         pd.DataFrame(audit_rows).to_csv(os.path.join(TABLES_DIR, "convnext_gradcam_analysis.csv"), index=False)
 
 
-def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, tau=0.50, num_passes=30):
+def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, tau=0.50, w_cx=0.60, num_passes=30):
     """
     Executes N=30 stochastic MC-Dropout forward passes on the Dual-Branch Ensemble,
     computes Predictive Entropy and Entropy Gap (Incorrect vs Correct), and saves the
@@ -457,7 +470,7 @@ def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, 
                 imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
                 st_log, _, _ = convnext_net(imgs, phys)
                 g_st_log, _ = geom_mlp(geom)
-                p_ens = (0.60 * torch.sigmoid(st_log) + 0.40 * torch.sigmoid(g_st_log)).cpu().numpy()
+                p_ens = (w_cx * torch.sigmoid(st_log) + (1.0 - w_cx) * torch.sigmoid(g_st_log)).cpu().numpy()
                 p_batch.append(p_ens)
             pass_probs.append(np.concatenate(p_batch))
 
@@ -512,7 +525,7 @@ def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, 
     }, mean_prob, epistemic_std, entropy
 
 
-def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base_bal_acc, tau=0.50, batch_size=32):
+def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base_bal_acc, tau=0.50, w_cx=0.60, batch_size=32):
     """Quantifies Balanced Accuracy drop when each Wake/Radon physics feature is randomly permuted."""
     convnext_net.eval()
     geom_mlp.eval()
@@ -534,7 +547,7 @@ def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base
             for imgs, phys, geom, _, _, _ in loader:
                 st_log, _, _ = convnext_net(imgs.to(DEVICE), phys.to(DEVICE))
                 g_st_log, _ = geom_mlp(geom.to(DEVICE))
-                p_all.append((0.60 * torch.sigmoid(st_log) + 0.40 * torch.sigmoid(g_st_log)).cpu().numpy())
+                p_all.append((w_cx * torch.sigmoid(st_log) + (1.0 - w_cx) * torch.sigmoid(g_st_log)).cpu().numpy())
         p_all = np.concatenate(p_all)
         b = (p_all >= tau).astype(int)
         st_acc = np.mean(b[test_ds.state_labels == 0] == 0)
@@ -639,7 +652,8 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
 
-    best_score = -1.0
+    best_cx_score = -1.0
+    best_geom_score = -1.0
     t_start = time.time()
 
     for epoch in range(1, epochs + 1):
@@ -657,10 +671,11 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
                 g_st_log, g_dir_log = geom_mlp(geom)
 
                 loss_cx = criterion(st_log, dir_log, rot_out, state_t, dir_t, rot_t, phys[:, 5])
-                loss_g = bce_geom(g_st_log, state_t) + 0.5 * ce_geom_dir(g_dir_log, dir_t)
-                loss = loss_cx + 0.4 * loss_g
+                loss_g = bce_geom(g_st_log, state_t) + 0.4 * ce_geom_dir(g_dir_log, dir_t)
+                loss = loss_cx + 0.5 * loss_g
 
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(list(convnext_net.parameters()) + list(geom_mlp.parameters()), max_norm=2.0)
             scaler.step(optimizer)
             scaler.update()
             running_loss += loss.item() * len(state_t)
@@ -668,10 +683,10 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
         scheduler.step()
         train_loss = running_loss / max(1, len(train_loader.dataset))
 
-        # Validation Soft-Voting Check
+        # Independent Validation Check for ConvNeXt Branch A & Geometry MLP Branch B
         convnext_net.eval()
         geom_mlp.eval()
-        v_st_p, v_dir_p, v_rot_p = [], [], []
+        vcx_p, vg_p, v_dir_cx, v_dir_g, v_rot_p = [], [], [], [], []
         v_st_t, v_dir_t, v_rot_t = [], [], []
 
         with torch.no_grad():
@@ -680,61 +695,75 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
                 st_log, dir_log, rot_out = convnext_net(imgs, phys)
                 g_st_log, g_dir_log = geom_mlp(geom)
 
-                p_st = 0.60 * torch.sigmoid(st_log) + 0.40 * torch.sigmoid(g_st_log)
-                p_dir = 0.60 * torch.softmax(dir_log, dim=1) + 0.40 * torch.softmax(g_dir_log, dim=1)
-
-                v_st_p.append(p_st.cpu().numpy())
-                v_dir_p.append(p_dir.cpu().numpy())
+                vcx_p.append(torch.sigmoid(st_log).cpu().numpy())
+                vg_p.append(torch.sigmoid(g_st_log).cpu().numpy())
+                v_dir_cx.append(torch.softmax(dir_log, dim=1).cpu().numpy())
+                v_dir_g.append(torch.softmax(g_dir_log, dim=1).cpu().numpy())
                 v_rot_p.append(rot_out.cpu().numpy())
                 v_st_t.append(state_t.numpy())
                 v_dir_t.append(dir_t.numpy())
                 v_rot_t.append(rot_t.numpy())
 
-        val_res = evaluate_predictions(
-            np.concatenate(v_st_p), np.concatenate(v_dir_p), np.concatenate(v_rot_p),
-            np.concatenate(v_st_t), np.concatenate(v_dir_t), np.concatenate(v_rot_t),
-            tau=0.50
-        )
+        vcx_p_np = np.concatenate(vcx_p)
+        vg_p_np = np.concatenate(vg_p)
+        v_dir_cx_np = np.concatenate(v_dir_cx)
+        v_dir_g_np = np.concatenate(v_dir_g)
+        v_rot_np = np.concatenate(v_rot_p)
+        v_st_np = np.concatenate(v_st_t)
+        v_dir_np = np.concatenate(v_dir_t)
+        v_rot_t_np = np.concatenate(v_rot_t)
 
-        # Combined selection score balances binary state and directional turn discrimination
-        sel_score = 0.7 * val_res["balanced_accuracy"] + 0.3 * val_res["dir_3class_balanced_acc"]
+        cx_res = evaluate_predictions(vcx_p_np, v_dir_cx_np, v_rot_np, v_st_np, v_dir_np, v_rot_t_np, tau=0.50)
+        g_res = evaluate_predictions(vg_p_np, v_dir_g_np, v_rot_np, v_st_np, v_dir_np, v_rot_t_np, tau=0.50)
+
+        cx_score = 0.7 * cx_res["balanced_accuracy"] + 0.3 * cx_res["dir_3class_balanced_acc"]
+        g_score = 0.7 * g_res["balanced_accuracy"] + 0.3 * g_res["dir_3class_balanced_acc"]
+
         print(
             f"Epoch {epoch:02d}/{epochs:02d} | Loss: {train_loss:.4f} | "
-            f"Val BalAcc: {val_res['balanced_accuracy']*100:.2f}% (St:{val_res['straight_accuracy']*100:.1f}%, Tu:{val_res['turning_accuracy']*100:.1f}%) | "
-            f"Val DirBal: {val_res['dir_3class_balanced_acc']*100:.1f}%"
+            f"ConvNeXt BalAcc: {cx_res['balanced_accuracy']*100:.1f}% (Dir:{cx_res['dir_3class_balanced_acc']*100:.1f}%) | "
+            f"GeomMLP BalAcc: {g_res['balanced_accuracy']*100:.1f}%"
         )
 
-        if sel_score > best_score:
-            best_score = sel_score
+        if cx_score > best_cx_score:
+            best_cx_score = cx_score
             torch.save(convnext_net.state_dict(), os.path.join(CHECKPOINTS_DIR, "convnext_multitask_best.pt"))
+        if g_score > best_geom_score:
+            best_geom_score = g_score
             torch.save(geom_mlp.state_dict(), os.path.join(CHECKPOINTS_DIR, "geometry_mlp_best.pt"))
 
     print(f"\n[TRAINING COMPLETE] Elapsed: {(time.time() - t_start)/60.0:.2f} min")
 
     # ----------------------------------------------------------------------------------------------
-    # Calibrate Threshold Strictly on Validation Split (Zero Test Leakage!)
+    # Calibrate Optimal Soft-Voting Weight w & Threshold tau Strictly on Validation Split!
     # ----------------------------------------------------------------------------------------------
     convnext_net.load_state_dict(torch.load(os.path.join(CHECKPOINTS_DIR, "convnext_multitask_best.pt"), map_location=DEVICE))
     geom_mlp.load_state_dict(torch.load(os.path.join(CHECKPOINTS_DIR, "geometry_mlp_best.pt"), map_location=DEVICE))
     convnext_net.eval()
     geom_mlp.eval()
 
-    v_st_p, v_st_t = [], []
+    vcx_p, vg_p, v_st_t = [], [], []
     with torch.no_grad():
         for imgs, phys, geom, state_t, _, _ in val_loader:
             st_log, _, _ = convnext_net(imgs.to(DEVICE), phys.to(DEVICE))
             g_st_log, _ = geom_mlp(geom.to(DEVICE))
-            v_st_p.append((0.60 * torch.sigmoid(st_log) + 0.40 * torch.sigmoid(g_st_log)).cpu().numpy())
+            vcx_p.append(torch.sigmoid(st_log).cpu().numpy())
+            vg_p.append(torch.sigmoid(g_st_log).cpu().numpy())
             v_st_t.append(state_t.numpy())
-    v_st_p, v_st_t = np.concatenate(v_st_p), np.concatenate(v_st_t)
+    vcx_p, vg_p, v_st_t = np.concatenate(vcx_p), np.concatenate(vg_p), np.concatenate(v_st_t)
 
-    best_tau, best_val_bal = 0.50, 0.0
-    for tau in np.arange(0.30, 0.76, 0.02):
-        b = (v_st_p >= tau).astype(int)
-        bal = 0.5 * (np.mean(b[v_st_t == 0] == 0) + np.mean(b[v_st_t == 1] == 1))
-        if bal > best_val_bal:
-            best_val_bal = bal
-            best_tau = float(tau)
+    best_w, best_tau, best_val_bal = 0.60, 0.50, 0.0
+    for w in (0.30, 0.40, 0.50, 0.60, 0.70, 0.80):
+        v_ens = w * vcx_p + (1.0 - w) * vg_p
+        for tau in np.arange(0.30, 0.76, 0.02):
+            b = (v_ens >= tau).astype(int)
+            bal = 0.5 * (np.mean(b[v_st_t == 0] == 0) + np.mean(b[v_st_t == 1] == 1))
+            if bal > best_val_bal:
+                best_val_bal = bal
+                best_w = float(w)
+                best_tau = float(tau)
+
+    print(f"[CALIBRATION ON VAL] Optimal Soft-Vote Weight w_ConvNeXt={best_w:.2f}, tau={best_tau:.2f} -> Val BalAcc={best_val_bal*100:.2f}%")
 
     # ----------------------------------------------------------------------------------------------
     # Final Evaluation on Unseen Test Split (Full & Frozen UEIKAP Subset)
@@ -750,8 +779,8 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
                 torch.cuda.synchronize()
             times.append((time.time() - t0) / len(imgs))
 
-            t_st_p.append((0.60 * torch.sigmoid(st_log) + 0.40 * torch.sigmoid(g_st_log)).cpu().numpy())
-            t_dir_p.append((0.60 * torch.softmax(dir_log, dim=1) + 0.40 * torch.softmax(g_dir_log, dim=1)).cpu().numpy())
+            t_st_p.append((best_w * torch.sigmoid(st_log) + (1.0 - best_w) * torch.sigmoid(g_st_log)).cpu().numpy())
+            t_dir_p.append((best_w * torch.softmax(dir_log, dim=1) + (1.0 - best_w) * torch.softmax(g_dir_log, dim=1)).cpu().numpy())
             t_rot_p.append(rot_out.cpu().numpy())
 
     t_st_p = np.concatenate(t_st_p)
@@ -763,6 +792,7 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
         test_ds.state_labels, test_ds.dir_labels, test_ds.rot_values,
         tau=best_tau
     )
+    full_metrics["calibrated_w_convnext"] = best_w
     full_metrics["latency_ms_per_ship"] = float(np.mean(times) * 1000.0)
     full_metrics["throughput_fps"] = float(1.0 / (np.mean(times) + 1e-6))
 
@@ -784,7 +814,7 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     # ----------------------------------------------------------------------------------------------
     print("\n[UNCERTAINTY] Running N=30 MC-Dropout passes across unseen test set...")
     unc_metrics, mc_mean, mc_std, mc_entropy = run_mc_dropout_uncertainty(
-        convnext_net, geom_mlp, test_loader, test_ds.state_labels, tau=best_tau, num_passes=30
+        convnext_net, geom_mlp, test_loader, test_ds.state_labels, tau=best_tau, w_cx=best_w, num_passes=30
     )
     results["mc_dropout_uncertainty"] = unc_metrics
 
@@ -793,7 +823,7 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     # ----------------------------------------------------------------------------------------------
     print("[EXPLAINABILITY] Computing permutation importance across 12 Wake/Radon features...")
     imp_df = compute_physics_permutation_importance(
-        convnext_net, geom_mlp, test_ds, full_metrics["balanced_accuracy"], tau=best_tau, batch_size=batch_size
+        convnext_net, geom_mlp, test_ds, full_metrics["balanced_accuracy"], tau=best_tau, w_cx=best_w, batch_size=batch_size
     )
     results["top_physics_features"] = imp_df.head(5).to_dict("records")
 

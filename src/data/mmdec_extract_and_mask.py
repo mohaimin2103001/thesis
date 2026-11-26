@@ -108,7 +108,7 @@ def latlon_to_chunk_pixel(lat, lon, corner_row, chunk_size=800):
     return float(px[0]), float(px[1])
 
 
-def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=120):
+def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=180):
     """
     1. Finds all AIS pings synchronized to a Sentinel-1 overpass (chunk_folder != null).
     2. Loads +-window_sec AIS trajectory for each matched MMSI to compute unwrapped d(COG)/dt (deg/min).
@@ -123,10 +123,11 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=120):
     ]
     table = pq.read_table(ais_path, columns=cols)
     df_all = table.to_pandas()
-    print(f"[MMDEC AIS] Loaded {len(df_all):,} total AIS messages.")
+    print(f"[MMDEC AIS] Loaded {len(df_all):,} total AIS messages. Date dtype: {df_all['Date'].dtype}")
 
-    # Convert Date to UTC seconds
-    df_all["ts_sec"] = pd.to_datetime(df_all["Date"], utc=True).astype("int64") // 10**9
+    # Universal resolution-safe conversion to UTC epoch seconds (works on ns, us, ms, s)
+    dt_utc = pd.to_datetime(df_all["Date"], utc=True)
+    df_all["ts_sec"] = (dt_utc - pd.Timestamp("1970-01-01", tz="UTC")).dt.total_seconds().astype("int64")
 
     # Synchronized overpass detections
     sync_df = df_all[df_all["chunk_folder"].notna() & df_all["id_chunk"].notna()].copy()
@@ -150,7 +151,6 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=120):
         (df_all["CourseOverGroundDegrees"] < 360.0)
     ][["Mmsi", "ts_sec", "CourseOverGroundDegrees", "SpeedOverGround"]].sort_values(["Mmsi", "ts_sec"])
 
-    # Pre-split trajectory dictionary by Mmsi for O(1) lookup
     mmsi_groups = {
         mmsi: (grp["ts_sec"].values, grp["CourseOverGroundDegrees"].values)
         for mmsi, grp in traj_df.groupby("Mmsi", sort=False)
@@ -166,26 +166,30 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=120):
         cog = float(row["CourseOverGroundDegrees"])
         hdg = float(row["TrueHeadingDegrees"]) if (pd.notna(row["TrueHeadingDegrees"]) and row["TrueHeadingDegrees"] < 360.0) else cog
         drift = ((cog - hdg + 180.0) % 360.0) - 180.0
+        raw_rot = float(row["RateOfTurn"]) if pd.notna(row["RateOfTurn"]) else -128.0
 
         ts_arr, cog_arr = mmsi_groups.get(mmsi, (None, None))
-        if ts_arr is None:
-            continue
+        rot_deg_min = None
+        delta_cog = None
 
-        mask = (ts_arr >= t0 - window_sec) & (ts_arr <= t0 + window_sec)
-        t_win = ts_arr[mask]
-        c_win = cog_arr[mask]
+        if ts_arr is not None:
+            mask = (ts_arr >= t0 - window_sec) & (ts_arr <= t0 + window_sec)
+            t_win = ts_arr[mask]
+            c_win = cog_arr[mask]
+            if len(t_win) >= 2 and (t_win[-1] - t_win[0]) >= 15:
+                unwrapped_deg = np.degrees(np.unwrap(np.radians(c_win)))
+                dt_min = (t_win - t0) / 60.0
+                rot_deg_min = float(np.polyfit(dt_min, unwrapped_deg, 1)[0])
+                delta_cog = float(abs(unwrapped_deg[-1] - unwrapped_deg[0]))
 
-        if len(t_win) < 3 or (t_win[-1] - t_win[0]) < 30:
-            continue
+        # Fallback to ITU-R M.1371 RateOfTurn sensor decoding if sparse satellite AIS pings
+        if rot_deg_min is None:
+            if -126.0 <= raw_rot <= 126.0 and raw_rot != 0.0:
+                rot_deg_min = float(np.sign(raw_rot) * ((abs(raw_rot) / 4.733) ** 2))
+                delta_cog = abs(rot_deg_min) * 2.0
+            else:
+                continue
 
-        # Unwrap angular trajectory to prevent 0/360 jump artifacts
-        unwrapped_deg = np.degrees(np.unwrap(np.radians(c_win)))
-        dt_min = (t_win - t0) / 60.0
-        # Linear regression slope = true Rate of Turn (deg/min)
-        rot_deg_min = float(np.polyfit(dt_min, unwrapped_deg, 1)[0])
-        delta_cog = float(abs(unwrapped_deg[-1] - unwrapped_deg[0]))
-
-        # Sanity cap against GPS glitch (> 100 deg/min is physically impossible for commercial ships)
         if abs(rot_deg_min) > 100.0:
             continue
 
@@ -200,13 +204,15 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=120):
             "cog": cog,
             "heading": hdg,
             "course_heading_drift": drift,
-            "rot_raw": float(row["RateOfTurn"]) if pd.notna(row["RateOfTurn"]) else -128.0,
+            "rot_raw": raw_rot,
             "rot_deg_min": rot_deg_min,
             "delta_cog_win": delta_cog
         })
 
     cand_df = pd.DataFrame(records)
     print(f"[MMDEC AIS] Validated trajectories with exact ROT: {len(cand_df):,}")
+    if len(cand_df) == 0:
+        raise RuntimeError("No MMDEC AIS trajectories produced valid ROT. Check timestamp parsing and columns.")
     return cand_df
 
 
@@ -394,13 +400,14 @@ def run_mmdec_harvest_and_mask(
     paths = crop_df["crop_path"].tolist()
     mask_paths = []
     radon_records = []
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
     for start in tqdm(range(0, len(paths), batch_size), desc="Running Wake-Net + Radon"):
         batch_paths = paths[start:start + batch_size]
         imgs = []
         for p in batch_paths:
             g = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
-            g_res = cv2.resize(g, (384, 384)).astype(np.float32) / 255.0
+            g_res = clahe.apply(cv2.resize(g, (384, 384))).astype(np.float32) / 255.0
             imgs.append(g_res)
         batch_t = torch.from_numpy(np.array(imgs)).unsqueeze(1).to(device)
 

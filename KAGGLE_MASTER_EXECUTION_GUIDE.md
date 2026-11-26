@@ -26,8 +26,10 @@ import shutil
 print("=" * 80)
 print("=== 1. CLONING MASTER THESIS REPOSITORY ===")
 print("=" * 80)
-!rm -rf /kaggle/working/thesis
-!git clone https://github.com/mohaimin2103001/thesis.git /kaggle/working/thesis
+if os.path.exists('/kaggle/working/thesis/.git'):
+    !git -C /kaggle/working/thesis fetch origin && !git -C /kaggle/working/thesis reset --hard origin/main
+else:
+    !git clone https://github.com/mohaimin2103001/thesis.git /kaggle/working/thesis
 %cd /kaggle/working/thesis
 
 print("\n=== 2. INSTALLING DEPENDENCIES ===")
@@ -77,7 +79,7 @@ if not os.path.exists(f'{mmdec_dir}/Dataset_S1_chunks.zip'):
 print("\n" + "=" * 80)
 print("=== 4. STAGE 1: TRAINING HYBRID WAKE-NET (ResNet-50 + scSE + Radon) ===")
 print("=" * 80)
-!python -m src.wake.train_wake_net --epochs 20 --batch_size 8 --lr 2e-4
+!python -m src.wake.train_wake_net --epochs 35 --batch_size 8 --lr 3e-4
 
 print("\n" + "=" * 80)
 print("=== 5. STAGE 2: MMDEC HARVESTER + WAKE-NET AUTO-MASKING + RADON ===")
@@ -88,7 +90,7 @@ print("=" * 80)
 print("\n" + "=" * 80)
 print("=== 6. STAGE 3: TRAINING DUAL-BRANCH CONVNEXT + LEE + GEOMETRY ENSEMBLE ===")
 print("=" * 80)
-!python kaggle/KAGGLE_MASTER_EXPANDED_SUITE.py --epochs 25 --batch_size 32 --lr 2e-4
+!python kaggle/KAGGLE_MASTER_EXPANDED_SUITE.py --epochs 25 --batch_size 32 --lr 2e-4 --gradcam_per_class -1
 
 print("\n" + "=" * 80)
 print("=== 7. PACKAGING WEIGHTS, METRICS & GRAD-CAM VISUALS ===")
