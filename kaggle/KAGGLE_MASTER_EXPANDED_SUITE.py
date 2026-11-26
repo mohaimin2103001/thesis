@@ -331,8 +331,12 @@ def evaluate_predictions(state_probs, dir_probs, rot_preds, state_true, dir_true
     }
 
 
-def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, max_samples=6):
-    """Generates comparative visualization of Raw SAR vs 7x7 Lee-Filtered ConvNeXt Grad-CAM."""
+def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=4):
+    """
+    Generates comparative Raw SAR vs 7x7 Lee-Filtered ConvNeXt Grad-CAM visualizations
+    across Straight, Port, and Starboard test vessels, overlays wake mask contours,
+    and quantifies Inside-Wake Attention Concentration in tables/convnext_gradcam_analysis.csv.
+    """
     convnext_net.eval()
     target_layer = convnext_net.backbone.stages[-1]
     activations = []
@@ -347,21 +351,30 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, max_samples=6):
     h1 = target_layer.register_forward_hook(fwd_hook)
     h2 = target_layer.register_full_backward_hook(bwd_hook)
 
-    # Pick turning samples first
-    turn_indices = [i for i in range(len(test_ds)) if test_ds.state_labels[i] == 1][:max_samples]
-    for k, idx in enumerate(turn_indices):
+    # Balanced selection across Straight (0), Port (1), Starboard (2)
+    selected_indices = []
+    for cls_id in (0, 1, 2):
+        cls_idxs = [i for i in range(len(test_ds)) if test_ds.dir_labels[i] == cls_id][:num_per_class]
+        selected_indices.extend(cls_idxs)
+
+    audit_rows = []
+    for k, idx in enumerate(selected_indices):
         activations.clear()
         gradients.clear()
-        img_t, phys_t, _, _, _, _ = test_ds[idx]
+        img_t, phys_t, _, st_true, dir_true, rot_true = test_ds[idx]
         x_img = img_t.unsqueeze(0).to(DEVICE).requires_grad_(True)
         x_phys = phys_t.unsqueeze(0).to(DEVICE)
 
         with torch.no_grad():
             lee_img = convnext_net.speckle_filter(x_img).squeeze().cpu().numpy()
 
-        st_logit, _, _ = convnext_net(x_img, x_phys)
+        st_logit, dir_logits, rot_pred = convnext_net(x_img, x_phys)
         convnext_net.zero_grad()
-        st_logit.backward()
+
+        # Target predicted directional class (or turning class for maneuver saliency)
+        pred_cls = int(torch.argmax(dir_logits, dim=1).item())
+        score = dir_logits[0, pred_cls] if pred_cls != 0 else st_logit[0]
+        score.backward()
 
         act = activations[0][0]
         grad = gradients[0][0]
@@ -370,23 +383,175 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, max_samples=6):
         cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
         cam_res = cv2.resize(cam, (256, 256))
 
+        # Overlay wake mask contour & compute wake attention concentration
+        row = test_ds.df.iloc[idx]
+        m_path = resolve_path(str(row.get("wake_mask_path", "")))
+        mask_bin = None
+        wake_energy_ratio = np.nan
+        if os.path.exists(m_path):
+            m_img = cv2.imread(m_path, cv2.IMREAD_GRAYSCALE)
+            if m_img is not None:
+                m_res = cv2.resize(m_img, (256, 256), interpolation=cv2.INTER_NEAREST)
+                mask_bin = m_res > 127
+                total_e = float(np.sum(cam_res)) + 1e-8
+                wake_energy_ratio = float(np.sum(cam_res[mask_bin]) / total_e)
+
         raw_np = img_t.squeeze().numpy()
         fig, axes = plt.subplots(1, 3, figsize=(12, 4))
         axes[0].imshow(raw_np, cmap="gray")
-        axes[0].set_title("Raw SAR Chip")
+        axes[0].set_title(f"Raw SAR ({row.get('source_dataset', 'SAR')})")
         axes[1].imshow(lee_img, cmap="gray")
         axes[1].set_title("7x7 Lee Speckle Filtered")
         axes[2].imshow(lee_img, cmap="gray")
         axes[2].imshow(cam_res, cmap="jet", alpha=0.45)
-        axes[2].set_title(f"ConvNeXt Grad-CAM ({test_ds.df.iloc[idx].get('direction', 'Turn')})")
+        if mask_bin is not None:
+            axes[2].contour(mask_bin.astype(float), levels=[0.5], colors="white", linewidths=1.2)
+        dir_str = row.get("direction", "None")
+        axes[2].set_title(f"Grad-CAM | GT:{row.get('state')}/{dir_str} | ROT:{rot_true:.1f}")
         for ax in axes:
             ax.axis("off")
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"convnext_gradcam_{k+1}.png"), dpi=150)
         plt.close(fig)
 
+        audit_rows.append({
+            "sample_id": row.get("sample_id", f"idx_{idx}"),
+            "state_true": row.get("state", "Unknown"),
+            "direction_true": dir_str,
+            "rot_true": float(rot_true),
+            "prob_turn_convnext": float(torch.sigmoid(st_logit).item()),
+            "rot_pred": float(rot_pred.item()),
+            "inside_wake_energy_ratio": wake_energy_ratio
+        })
+
     h1.remove()
     h2.remove()
+    if audit_rows:
+        pd.DataFrame(audit_rows).to_csv(os.path.join(TABLES_DIR, "convnext_gradcam_analysis.csv"), index=False)
+
+
+def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, tau=0.50, num_passes=30):
+    """
+    Executes N=30 stochastic MC-Dropout forward passes on the Dual-Branch Ensemble,
+    computes Predictive Entropy and Entropy Gap (Incorrect vs Correct), and saves the
+    Selective Error Rejection Curve (figures/convnext_uncertainty_rejection_curve.png).
+    """
+    convnext_net.eval()
+    geom_mlp.eval()
+    # Activate ONLY Dropout layers while keeping BatchNorm frozen in eval mode
+    for m in list(convnext_net.modules()) + list(geom_mlp.modules()):
+        if isinstance(m, (nn.Dropout, nn.Dropout2d)):
+            m.train()
+
+    pass_probs = []
+    with torch.no_grad():
+        for _ in range(num_passes):
+            p_batch = []
+            for imgs, phys, geom, _, _, _ in test_loader:
+                imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
+                st_log, _, _ = convnext_net(imgs, phys)
+                g_st_log, _ = geom_mlp(geom)
+                p_ens = (0.60 * torch.sigmoid(st_log) + 0.40 * torch.sigmoid(g_st_log)).cpu().numpy()
+                p_batch.append(p_ens)
+            pass_probs.append(np.concatenate(p_batch))
+
+    convnext_net.eval()
+    geom_mlp.eval()
+
+    mc_matrix = np.stack(pass_probs, axis=0)  # (num_passes, N_test)
+    mean_prob = np.mean(mc_matrix, axis=0)
+    epistemic_std = np.std(mc_matrix, axis=0)
+    eps = 1e-7
+    p_clip = np.clip(mean_prob, eps, 1.0 - eps)
+    entropy = -(p_clip * np.log(p_clip) + (1.0 - p_clip) * np.log(1.0 - p_clip))
+
+    preds = (mean_prob >= tau).astype(int)
+    correct_mask = preds == state_true
+    incorrect_mask = ~correct_mask
+
+    overall_acc = float(np.mean(correct_mask))
+    ent_correct = float(np.mean(entropy[correct_mask])) if np.any(correct_mask) else 0.0
+    ent_incorrect = float(np.mean(entropy[incorrect_mask])) if np.any(incorrect_mask) else 0.0
+
+    # Selective Rejection Curve
+    sorted_idx = np.argsort(entropy)
+    rej_rates = np.linspace(0.0, 0.50, 21)
+    retained_err = []
+    for r in rej_rates:
+        keep_n = max(1, int(len(sorted_idx) * (1.0 - r)))
+        k_idx = sorted_idx[:keep_n]
+        retained_err.append(1.0 - float(np.mean(preds[k_idx] == state_true[k_idx])))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(rej_rates * 100, np.array(retained_err) * 100, marker="o", lw=2.2, color="#d62728", label="MC-Dropout Selective Error")
+    ax.axhline(y=(1.0 - overall_acc) * 100, color="gray", linestyle="--", label=f"Unfiltered Error ({(1.0 - overall_acc)*100:.1f}%)")
+    ax.set_title("ConvNeXt + Lee + Geometry Ensemble: Selective Error Rejection Curve (N=30 MC Passes)", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Rejected High-Entropy Fraction (% deferred to operator)", fontsize=10)
+    ax.set_ylabel("Error Rate on Retained Vessels (%)", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIGURES_DIR, "convnext_uncertainty_rejection_curve.png"), dpi=200)
+    plt.close(fig)
+
+    return {
+        "mc_passes": int(num_passes),
+        "mean_epistemic_std": float(np.mean(epistemic_std)),
+        "mean_entropy_correct": ent_correct,
+        "mean_entropy_incorrect": ent_incorrect,
+        "entropy_gap": ent_incorrect - ent_correct,
+        "error_at_0pct_rejection": float(retained_err[0]),
+        "error_at_20pct_rejection": float(retained_err[8]),
+        "error_at_40pct_rejection": float(retained_err[16]),
+    }, mean_prob, epistemic_std, entropy
+
+
+def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base_bal_acc, tau=0.50, batch_size=32):
+    """Quantifies Balanced Accuracy drop when each Wake/Radon physics feature is randomly permuted."""
+    convnext_net.eval()
+    geom_mlp.eval()
+    geom_indices = [PHYSICS_FEATURES.index(c) for c in GEOMETRY_FEATURES]
+    imp_rows = []
+
+    orig_phys = test_ds.phys_norm.copy()
+    orig_geom = test_ds.geom_norm.copy()
+
+    for f_idx, fname in enumerate(PHYSICS_FEATURES):
+        perm_phys = orig_phys.copy()
+        perm_phys[:, f_idx] = np.random.permutation(perm_phys[:, f_idx])
+        test_ds.phys_norm = perm_phys
+        test_ds.geom_norm = perm_phys[:, geom_indices]
+
+        loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+        p_all = []
+        with torch.no_grad():
+            for imgs, phys, geom, _, _, _ in loader:
+                st_log, _, _ = convnext_net(imgs.to(DEVICE), phys.to(DEVICE))
+                g_st_log, _ = geom_mlp(geom.to(DEVICE))
+                p_all.append((0.60 * torch.sigmoid(st_log) + 0.40 * torch.sigmoid(g_st_log)).cpu().numpy())
+        p_all = np.concatenate(p_all)
+        b = (p_all >= tau).astype(int)
+        st_acc = np.mean(b[test_ds.state_labels == 0] == 0)
+        tu_acc = np.mean(b[test_ds.state_labels == 1] == 1)
+        bal = 0.5 * (st_acc + tu_acc)
+        imp_rows.append({"feature": fname, "permuted_bal_acc": float(bal), "importance_drop": float(base_bal_acc - bal)})
+
+    test_ds.phys_norm = orig_phys
+    test_ds.geom_norm = orig_geom
+
+    imp_df = pd.DataFrame(imp_rows).sort_values("importance_drop", ascending=False)
+    imp_df.to_csv(os.path.join(TABLES_DIR, "convnext_physics_feature_importance.csv"), index=False)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    plot_df = imp_df.sort_values("importance_drop", ascending=True)
+    ax.barh(plot_df["feature"], plot_df["importance_drop"] * 100, color="#1f77b4")
+    ax.set_xlabel("Balanced Accuracy Drop When Permuted (%)", fontsize=10)
+    ax.set_title("Hydrodynamic Wake & Radon Feature Importance (Explainability)", fontsize=11, fontweight="bold")
+    ax.grid(True, axis="x", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIGURES_DIR, "convnext_physics_feature_importance.png"), dpi=200)
+    plt.close(fig)
+    return imp_df
 
 
 def run_master_suite(epochs=25, batch_size=32, lr=2e-4):
@@ -608,6 +773,24 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4):
             )
             results["ueikap_frozen_test"] = ueikap_metrics
 
+    # ----------------------------------------------------------------------------------------------
+    # Epistemic Uncertainty Quantification (N=30 MC-Dropout Passes) & Selective Rejection Curve
+    # ----------------------------------------------------------------------------------------------
+    print("\n[UNCERTAINTY] Running N=30 MC-Dropout passes across unseen test set...")
+    unc_metrics, mc_mean, mc_std, mc_entropy = run_mc_dropout_uncertainty(
+        convnext_net, geom_mlp, test_loader, test_ds.state_labels, tau=best_tau, num_passes=30
+    )
+    results["mc_dropout_uncertainty"] = unc_metrics
+
+    # ----------------------------------------------------------------------------------------------
+    # Hydrodynamic Explainability: Physics/Radon Feature Permutation Importance
+    # ----------------------------------------------------------------------------------------------
+    print("[EXPLAINABILITY] Computing permutation importance across 12 Wake/Radon features...")
+    imp_df = compute_physics_permutation_importance(
+        convnext_net, geom_mlp, test_ds, full_metrics["balanced_accuracy"], tau=best_tau, batch_size=batch_size
+    )
+    results["top_physics_features"] = imp_df.head(5).to_dict("records")
+
     print("\n" + "=" * 80)
     print("FINAL PUBLICATION BENCHMARK SUMMARY (CALIBRATED ON VAL, FROZEN ON TEST)")
     print("=" * 80)
@@ -616,19 +799,22 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4):
     with open(os.path.join(CHECKPOINTS_DIR, "master_evaluation_metrics.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    # Save test predictions parquet
+    # Save test predictions parquet with per-vessel Uncertainty metrics
     pred_out = test_df[["sample_id", "source_dataset", "state", "direction"]].copy() if "source_dataset" in test_df.columns else test_df[["sample_id", "state", "direction"]].copy()
     pred_out["prob_turn_ensemble"] = t_st_p
+    pred_out["mc_mean_prob"] = mc_mean
+    pred_out["epistemic_std"] = mc_std
+    pred_out["predictive_entropy"] = mc_entropy
     pred_out["pred_state"] = np.where(t_st_p >= best_tau, "Turning", "Straight")
     inv_dir = {0: "None", 1: "Port", 2: "Starboard"}
     pred_out["pred_direction"] = [inv_dir[int(c)] for c in np.argmax(t_dir_p, axis=1)]
     pred_out["pred_rot_deg_min"] = t_rot_p
     pred_out.to_parquet(os.path.join(DATA_DIR, "processed", "expanded_test_predictions.parquet"), index=False)
 
-    # Generate Before-vs-After Lee Filter Grad-CAM Visualizations
+    # Generate Before-vs-After Lee Filter Grad-CAM + Wake Overlap Audit across Straight/Port/Starboard
     try:
-        generate_lee_vs_raw_gradcam(convnext_net, test_ds, GRADCAM_DIR, max_samples=6)
-        print(f"[GRAD-CAM] Saved comparative visualizations in {GRADCAM_DIR}")
+        generate_lee_vs_raw_gradcam(convnext_net, test_ds, GRADCAM_DIR, num_per_class=4)
+        print(f"[GRAD-CAM] Saved comparative visualizations & wake overlap CSV in {GRADCAM_DIR} and {TABLES_DIR}")
     except Exception as e:
         print(f"[WARNING] Grad-CAM visualization skipped: {e}")
 
