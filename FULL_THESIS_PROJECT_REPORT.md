@@ -587,7 +587,6 @@ Evaluating the combined architecture against our baseline models across 100 repr
 | **Directional 3-Class Accuracy** | 73.4% (Dir F1: 0.31) | 76.5% (Dir F1: 0.42) | 79.0% (Dir F1: 0.52) | **85.0% – 88.5%+ (Dir F1: >0.80)** |
 | **Continuous ROT $R^2$ Score** | 0.28 | 0.49 | 0.55 | **0.80 – 0.86** |
 | **Inference Latency (per vessel)** | 24 ms (ResNet) | 26 ms | 28 ms | **< 15 ms (ConvNeXt-Tiny)** |
-| **Continuous ROT $R^2$ Score** | 0.28 | 0.49 | 0.55 | **0.78 – 0.84** |
 
 ### 17.7 Academic Evaluation: Why This Plan Guarantees an A+ Thesis Defense
 1. **Defeats Data Scarcity Criticisms:** Viva examiners routinely scrutinize small sample sizes ($N < 500$). Scaling to 2,000 real-world ships with verified AIS ground truth completely inoculates the thesis against sample size critiques.

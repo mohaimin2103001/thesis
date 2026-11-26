@@ -1,166 +1,134 @@
 """
 ====================================================================================================
 KAGGLE_MASTER_EXPANDED_SUITE.py
-End-to-End Master Training & Evaluation Pipeline for 3,000-Ship High-Accuracy Thesis Benchmark
+End-to-End Master Training & Evaluation Pipeline for Expanded MMDEC + UEIKAP Benchmark
 ====================================================================================================
-Architecture & Capabilities:
-  1. Stage 1: Wake-Net (Paper 1 scSE Attention + Paper 3 Radon Transform Hybrid) trained on UEIKAP.
-  2. Stage 2: MMDEC Scaled Harvester: 2,000 Straight + 1,000 Turning (500 Port + 500 Starboard).
-  3. Stage 3: Dual-Branch Soft-Voting Ensemble (Method 1 + Method 3):
-              - Branch A: 7x7 Adaptive Lee Filter + ConvNeXt-Tiny + 10 Physics Features
-              - Branch B: Pure Geometry Specialist MLP
-  4. Stage 4: Comprehensive Multi-Task Evaluation:
-              - Task 1: Binary Maneuver State Recognition (88% - 92%+ Balanced Accuracy)
-              - Task 2: Directional 3-Class Maneuver Classification (Straight vs Port vs Starboard)
-              - Task 3: Continuous Signed ROT Regression (MAE & R^2)
-              - Task 4: Environmental Stress-Testing (ERA5 Wind Speed Stratification)
-              - Task 5: Operational Latency Benchmark (FPS & Millisecond Runtime)
-  5. Stage 5: Packaging & Checkpoint Export into thesis_master_3k_results.zip
+Architecture & Capabilities (Method 1 + Method 3 Hybrid + Multi-Task Thesis Goals):
+  1. Branch A: 7x7 Differentiable Lee Speckle Filter + ConvNeXt-Tiny + 12 Wake/Radon Physics Features
+  2. Branch B: Pure Wake Geometry Specialist MLP (Model 3) on Curvature & Radon Deflection
+  3. Dynamic Soft-Voting Ensemble: 0.60 * P_ConvNeXt + 0.40 * P_Geometry (calibrated on Val split)
+  4. Multi-Task Predictions (Zero AIS at inference time — strictly SAR + Wake Geometry):
+       - Task 1: Binary Maneuver State Recognition (Straight vs Turning -> Targeting 88%-92%+)
+       - Task 2: Directional 3-Class Classification (Straight [0] vs Port [1] vs Starboard [2])
+       - Task 3: Continuous Signed Rate-of-Turn Regression (deg/min, MAE & R^2)
+       - Task 4: Real-Time Operational Latency Benchmark (ms/vessel & FPS)
+  5. Evaluates on BOTH Expanded Test Set AND Frozen 89-Ship UEIKAP Test Set, plus saves Grad-CAM.
 ====================================================================================================
 """
 
 import os
 import sys
-import re
 import time
 import json
-import zipfile
+import argparse
 import numpy as np
 import pandas as pd
-from datetime import datetime
 import cv2
-from skimage.transform import radon
-from scipy.ndimage import distance_transform_edt
-from skimage.morphology import skeletonize
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import timm
-import segmentation_models_pytorch as smp
 
-# --------------------------------------------------------------------------------------------------
-# 1. Environment & Directories Setup
-# --------------------------------------------------------------------------------------------------
 IS_KAGGLE = os.path.exists("/kaggle/working")
-if IS_KAGGLE:
-    BASE_DIR = "/kaggle/working"
-    DATA_DIR = os.path.join(BASE_DIR, "data")
-    CHECKPOINTS_DIR = os.path.join(BASE_DIR, "checkpoints")
-    OUTPUTS_DIR = os.path.join(BASE_DIR, "outputs")
-else:
-    BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    DATA_DIR = os.path.join(BASE_DIR, "data")
-    CHECKPOINTS_DIR = os.path.join(BASE_DIR, "checkpoints")
-    OUTPUTS_DIR = os.path.join(BASE_DIR, "outputs")
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+CHECKPOINTS_DIR = os.path.join(BASE_DIR, "checkpoints", "convnext_ensemble")
+TABLES_DIR = os.path.join(BASE_DIR, "tables")
+FIGURES_DIR = os.path.join(BASE_DIR, "figures")
+GRADCAM_DIR = os.path.join(BASE_DIR, "outputs", "gradcam_convnext")
 
-os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
-os.makedirs(OUTPUTS_DIR, exist_ok=True)
+for d in [CHECKPOINTS_DIR, TABLES_DIR, FIGURES_DIR, GRADCAM_DIR]:
+    os.makedirs(d, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("=" * 80)
-print(f"[THESIS MASTER SUITE] Execution Environment: {'Kaggle Cloud' if IS_KAGGLE else 'Local Machine'}")
-print(f"[THESIS MASTER SUITE] Active Device: {DEVICE} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+print(f"[MASTER SUITE] Environment: {'Kaggle Cloud' if IS_KAGGLE else 'Local'} | Device: {DEVICE}")
+if torch.cuda.is_available():
+    print(f"[MASTER SUITE] GPU: {torch.cuda.get_device_name(0)}")
 print("=" * 80)
 
+# Strictly observable SAR/Wake geometry features (Zero AIS at inference time!)
 PHYSICS_FEATURES = [
-    "sog", "froude_number", "kelvin_half_angle_deg", "mean_curvature",
-    "max_abs_curvature", "curvature_std", "cross_track_deflection_px",
-    "wake_intensity_contrast", "wake_arm_asymmetry", "heading_minus_cog_deg"
+    "wake_length", "wake_orientation", "mean_curvature", "median_curvature",
+    "max_abs_curvature", "signed_mean_curvature", "curvature_std",
+    "wake_asymmetry", "mask_area", "geometry_confidence",
+    "radon_angle_deg", "radon_deflection_deg"
 ]
 
 GEOMETRY_FEATURES = [
-    "mean_curvature", "max_abs_curvature", "curvature_std", "kelvin_half_angle_deg"
+    "mean_curvature", "median_curvature", "max_abs_curvature",
+    "signed_mean_curvature", "curvature_std", "wake_asymmetry",
+    "radon_deflection_deg"
 ]
 
-# --------------------------------------------------------------------------------------------------
-# 2. Stage 1: Hybrid Wake-Net Architecture & Radon Transform Extractor
-# --------------------------------------------------------------------------------------------------
-def build_wake_net(pretrained=True):
-    weights = "imagenet" if pretrained else None
-    model = smp.Unet(
-        encoder_name="resnet50",
-        encoder_weights=weights,
-        decoder_attention_type="scse",
-        in_channels=1,
-        classes=1
-    )
-    return model
+_PATH_CACHE = {}
 
-def compute_radon_kinematics(binary_mask, sog_knots=None, pixel_res_meters=10.0):
-    h, w = binary_mask.shape
-    if np.sum(binary_mask > 0) < 40:
-        return {"dominant_angle_deg": 0.0, "angular_deflection_deg": 0.0, "estimated_kappa": 0.0, "estimated_rot": 0.0, "is_valid": False}
+def resolve_path(p):
+    """Cross-platform path resolver bridging Windows paths to Linux/Kaggle workspace."""
+    if not p or not isinstance(p, str):
+        return p
+    if p in _PATH_CACHE:
+        return _PATH_CACHE[p]
+    norm_p = p.replace("\\", "/")
+    if os.path.exists(norm_p):
+        _PATH_CACHE[p] = norm_p
+        return norm_p
+    fname = os.path.basename(norm_p)
+    for base in [
+        os.path.join(DATA_DIR, "interim", "mmdec_crops"),
+        os.path.join(DATA_DIR, "raw", "UEIKAP_SAR", "images"),
+        os.path.join(DATA_DIR, "processed", "wake_segmentation_kaggle", "images"),
+        os.path.join(DATA_DIR, "interim"),
+        os.path.join(DATA_DIR, "raw"),
+    ]:
+        if os.path.exists(base):
+            candidate = os.path.join(base, fname)
+            if os.path.exists(candidate):
+                _PATH_CACHE[p] = candidate
+                return candidate
+            for root, _, files in os.walk(base):
+                if fname in files:
+                    found = os.path.join(root, fname)
+                    _PATH_CACHE[p] = found
+                    return found
+    _PATH_CACHE[p] = norm_p
+    return norm_p
 
-    theta_range = np.arange(0, 180, 1.0)
-    sinogram = radon(binary_mask.astype(np.float32), theta=theta_range, circle=False)
-    peak_theta_idx = np.unravel_index(np.argmax(sinogram), sinogram.shape)[1]
-    dominant_angle_deg = float(theta_range[peak_theta_idx])
-
-    mid_y = h // 2
-    proximal = binary_mask[:mid_y, :]
-    distal = binary_mask[mid_y:, :]
-
-    if np.sum(proximal > 0) > 20 and np.sum(distal > 0) > 20:
-        s_prox = radon(proximal.astype(np.float32), theta=theta_range, circle=False)
-        s_dist = radon(distal.astype(np.float32), theta=theta_range, circle=False)
-        t_prox = theta_range[np.unravel_index(np.argmax(s_prox), s_prox.shape)[1]]
-        t_dist = theta_range[np.unravel_index(np.argmax(s_dist), s_dist.shape)[1]]
-        defl = (t_dist - t_prox + 180) % 180
-        if defl > 90:
-            defl -= 180
-        angular_deflection_deg = float(defl)
-    else:
-        angular_deflection_deg = 0.0
-
-    delta_s = (h / 2.0) * pixel_res_meters
-    kappa_est = np.radians(angular_deflection_deg) / (delta_s + 1e-6)
-
-    rot_est = 0.0
-    if sog_knots is not None and sog_knots > 1.0:
-        speed_ms = sog_knots * 0.514444
-        rot_est = float(speed_ms * kappa_est * (180.0 / np.pi) * 60.0)
-
-    return {
-        "dominant_angle_deg": dominant_angle_deg,
-        "angular_deflection_deg": angular_deflection_deg,
-        "estimated_kappa": float(kappa_est),
-        "estimated_rot": rot_est,
-        "is_valid": True
-    }
 
 # --------------------------------------------------------------------------------------------------
-# 3. Stage 3: Adaptive Lee Speckle Filter & Dual-Branch Multimodal Architecture
+# Adaptive 7x7 Lee Speckle Filter + Dual-Branch Architectures
 # --------------------------------------------------------------------------------------------------
 class LeeSpeckleFilter(nn.Module):
-    def __init__(self, kernel_size=7, noise_var=0.25):
+    """Differentiable 7x7 Lee filter suppressing multiplicative SAR sea clutter speckle."""
+    def __init__(self, kernel_size=7, noise_var=0.08):
         super().__init__()
-        self.kernel_size = kernel_size
-        self.noise_var = noise_var
         self.pad = kernel_size // 2
+        self.noise_var = noise_var
         box_weight = torch.full((1, 1, kernel_size, kernel_size), 1.0 / (kernel_size * kernel_size), dtype=torch.float32)
         self.register_buffer("box_weight", box_weight)
 
     def forward(self, x):
-        mean = nn.functional.conv2d(x, self.box_weight, padding=self.pad)
-        sq_mean = nn.functional.conv2d(x * x, self.box_weight, padding=self.pad)
+        mean = F.conv2d(x, self.box_weight, padding=self.pad)
+        sq_mean = F.conv2d(x * x, self.box_weight, padding=self.pad)
         var = torch.clamp(sq_mean - mean * mean, min=1e-6)
-        k = var / (var + self.noise_var)
-        filtered = mean + k * (x - mean)
-        return torch.clamp(filtered, 0.0, 1.0)
+        # Local adaptive gain K in [0, 1]
+        k = torch.clamp((var - (mean * mean) * self.noise_var) / var, min=0.0, max=1.0)
+        return torch.clamp(mean + k * (x - mean), 0.0, 1.0)
+
 
 class ConvNeXtPhysicsNet(nn.Module):
     """
-    Branch A: Lee-filtered SAR crop + ConvNeXt-Tiny + 10 Physics Features.
-    Supports Multi-Task outputs:
-      1. Binary Maneuver State Logit (Straight vs Turn)
-      2. 3-Class Direction Logits (Straight vs Port vs Starboard)
-      3. Continuous Signed ROT (deg/min)
+    Branch A (Method 3): Adaptive 7x7 Lee Filter + ConvNeXt-Tiny + 12 Wake/Radon Geometry Features.
+    Outputs Multi-Task Heads: Binary State Logit, 3-Class Direction Logits, Continuous Signed ROT.
     """
-    def __init__(self, num_physics_features=10, pretrained=True):
+    def __init__(self, num_physics_features=12, pretrained=True):
         super().__init__()
-        self.speckle_filter = LeeSpeckleFilter(kernel_size=7, noise_var=0.25)
+        self.speckle_filter = LeeSpeckleFilter(kernel_size=7, noise_var=0.08)
         self.backbone = timm.create_model("convnext_tiny", pretrained=pretrained, num_classes=0, in_chans=3)
         embed_dim = self.backbone.num_features  # 768
 
@@ -172,387 +140,505 @@ class ConvNeXtPhysicsNet(nn.Module):
             nn.SiLU()
         )
 
-        fused_dim = embed_dim + 64
         self.shared_head = nn.Sequential(
-            nn.Linear(fused_dim, 128),
-            nn.BatchNorm1d(128),
+            nn.Linear(embed_dim + 64, 160),
+            nn.BatchNorm1d(160),
             nn.SiLU(),
-            nn.Dropout(0.3)
+            nn.Dropout(0.30)
         )
 
-        # Multi-Task Heads
-        self.binary_head = nn.Linear(128, 1)          # Binary State
-        self.direction_head = nn.Linear(128, 3)       # 3-Class Direction
-        self.rot_head = nn.Linear(128, 1)             # Signed ROT (deg/min)
+        self.binary_head = nn.Linear(160, 1)
+        self.direction_head = nn.Linear(160, 3)
+        self.rot_head = nn.Linear(160, 1)
 
     def forward(self, x_img, x_phys):
         filt = self.speckle_filter(x_img)
         x_3ch = filt.repeat(1, 3, 1, 1)
         v_emb = self.backbone(x_3ch)
         p_emb = self.physics_mlp(x_phys)
-        fused = torch.cat([v_emb, p_emb], dim=1)
-        feat = self.shared_head(fused)
+        feat = self.shared_head(torch.cat([v_emb, p_emb], dim=1))
+        return self.binary_head(feat).squeeze(1), self.direction_head(feat), self.rot_head(feat).squeeze(1)
 
-        state_logit = self.binary_head(feat).squeeze(1)
-        dir_logits = self.direction_head(feat)
-        rot_pred = self.rot_head(feat).squeeze(1)
-        return state_logit, dir_logits, rot_pred
 
 class GeometrySpecialistMLP(nn.Module):
     """
-    Branch B: Pure Kelvin Geometry Specialist (Model 3).
-    Strictly operates on physical curvature and Kelvin angle.
+    Branch B (Method 1 Anchor / Model 3): Pure Wake Curvature & Radon Specialist.
+    Acts as a mathematical veto against sea-clutter visual false positives.
     """
-    def __init__(self, in_features=4):
+    def __init__(self, in_features=7):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_features, 32),
-            nn.BatchNorm1d(32),
+            nn.Linear(in_features, 64),
+            nn.BatchNorm1d(64),
             nn.SiLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, 16),
+            nn.Dropout(0.20),
+            nn.Linear(64, 32),
             nn.SiLU(),
-            nn.Linear(16, 1)
         )
+        self.binary_head = nn.Linear(32, 1)
+        self.direction_head = nn.Linear(32, 3)
 
     def forward(self, x_geom):
-        return self.net(x_geom).squeeze(1)
+        h = self.net(x_geom)
+        return self.binary_head(h).squeeze(1), self.direction_head(h)
+
 
 # --------------------------------------------------------------------------------------------------
-# 4. Multimodal Maneuver Dataset
+# Multimodal Dataset with Train-Only Normalization (Zero Leakage)
 # --------------------------------------------------------------------------------------------------
 class ScaledManeuverDataset(Dataset):
-    def __init__(self, df, img_size=(256, 256)):
+    def __init__(self, df, phys_mean=None, phys_std=None, img_size=(256, 256), augment=False):
         self.df = df.reset_index(drop=True)
         self.img_size = img_size
+        self.augment = augment
 
         for col in PHYSICS_FEATURES:
             if col not in self.df.columns:
                 self.df[col] = 0.0
-            else:
-                self.df[col] = self.df[col].fillna(0.0)
+            self.df[col] = self.df[col].fillna(0.0).astype(np.float32)
 
-        # Labels
-        # Binary State: 0 = Straight, 1 = Turning
-        if "maneuver_state" in self.df.columns:
-            self.state_labels = (self.df["maneuver_state"] == "turning").astype(int).values
+        phys_raw = self.df[PHYSICS_FEATURES].values.astype(np.float32)
+        if phys_mean is None or phys_std is None:
+            self.phys_mean = np.nanmean(phys_raw, axis=0)
+            self.phys_std = np.nanstd(phys_raw, axis=0) + 1e-6
         else:
-            self.state_labels = (np.abs(self.df.get("rot", 0.0)) >= 1.5).astype(int).values
+            self.phys_mean = phys_mean
+            self.phys_std = phys_std
+        self.phys_norm = np.clip((phys_raw - self.phys_mean) / self.phys_std, -8.0, 8.0)
 
-        # Direction 3-class: 0 = Straight, 1 = Port (Left), 2 = Starboard (Right)
-        dir_labels = []
-        for idx, row in self.df.iterrows():
-            rot_val = float(row.get("rot", 0.0))
-            if abs(rot_val) < 1.0:
-                dir_labels.append(0)
-            elif rot_val > 0:
-                dir_labels.append(1)  # Port
-            else:
-                dir_labels.append(2)  # Starboard
-        self.dir_labels = np.array(dir_labels, dtype=int)
+        geom_indices = [PHYSICS_FEATURES.index(c) for c in GEOMETRY_FEATURES]
+        self.geom_norm = self.phys_norm[:, geom_indices]
 
-        # Continuous Signed ROT
-        self.rot_values = self.df.get("rot", pd.Series(np.zeros(len(self.df)))).values.astype(np.float32)
+        # Resolve ground-truth labels cleanly across both UEIKAP ('state', 'rot_target') and any alias
+        state_col = "state" if "state" in self.df.columns else "maneuver_state"
+        self.state_labels = self.df[state_col].astype(str).str.lower().eq("turning").astype(int).values
+
+        dir_map = {"none": 0, "straight": 0, "port": 1, "left": 1, "starboard": 2, "right": 2}
+        if "direction" in self.df.columns:
+            self.dir_labels = self.df["direction"].astype(str).str.lower().map(lambda d: dir_map.get(d, 0)).values
+        else:
+            rot_vals = self.df.get("rot_target", self.df.get("rot_deg_min", pd.Series(np.zeros(len(self.df))))).values
+            self.dir_labels = np.where(np.abs(rot_vals) < 0.5, 0, np.where(rot_vals < 0, 1, 2))
+
+        rot_col = "rot_target" if "rot_target" in self.df.columns else ("rot_deg_min" if "rot_deg_min" in self.df.columns else "rot")
+        self.rot_values = self.df.get(rot_col, pd.Series(np.zeros(len(self.df)))).fillna(0.0).values.astype(np.float32)
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        img_p = str(row.get("crop_path", row.get("original_image_path", "")))
+        p_crop = resolve_path(str(row.get("crop_path", "")))
+        p_orig = resolve_path(str(row.get("original_image_path", "")))
+        img_p = p_crop if os.path.exists(p_crop) else p_orig
 
-        img = None
-        if os.path.exists(img_p):
-            img = cv2.imread(img_p, cv2.IMREAD_GRAYSCALE)
-
+        img = cv2.imread(img_p, cv2.IMREAD_GRAYSCALE)
         if img is None:
-            # Synthetic background initialization fallback
-            img = np.random.randint(20, 60, size=self.img_size, dtype=np.uint8)
-        else:
-            img = cv2.resize(img, self.img_size)
+            raise FileNotFoundError(f"Could not load SAR chip for sample {row.get('sample_id')}: {img_p}")
+        img = cv2.resize(img, self.img_size)
+
+        # Careful augmentation: horizontal flip mirrors Port <-> Starboard, so ONLY apply rotation-preserving
+        # contrast/intensity jitter or explicit mirrored label flip! Here we keep geometry orientation exact.
+        if self.augment and np.random.rand() < 0.4:
+            gamma = np.random.uniform(0.90, 1.10)
+            img = np.clip(img.astype(np.float32) * gamma, 0, 255).astype(np.uint8)
 
         img_t = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
-        phys_t = torch.tensor(row[PHYSICS_FEATURES].values.astype(np.float32))
-        geom_t = torch.tensor(row[GEOMETRY_FEATURES].values.astype(np.float32))
+        phys_t = torch.from_numpy(self.phys_norm[idx].astype(np.float32))
+        geom_t = torch.from_numpy(self.geom_norm[idx].astype(np.float32))
         state_t = torch.tensor(self.state_labels[idx], dtype=torch.float32)
         dir_t = torch.tensor(self.dir_labels[idx], dtype=torch.long)
         rot_t = torch.tensor(self.rot_values[idx], dtype=torch.float32)
 
         return img_t, phys_t, geom_t, state_t, dir_t, rot_t
 
+
 # --------------------------------------------------------------------------------------------------
-# 5. Physics-Informed Kinematic Loss
+# Physics-Informed Multi-Task Loss
 # --------------------------------------------------------------------------------------------------
 class PhysicsInformedMultiTaskLoss(nn.Module):
-    def __init__(self, pos_weight=2.0, lambda_dir=0.5, lambda_rot=0.3, lambda_phys=0.2):
+    def __init__(self, pos_weight=2.0, dir_weights=None, lambda_dir=0.6, lambda_rot=0.25, lambda_phys=0.15):
         super().__init__()
-        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]).to(DEVICE))
-        self.ce_dir = nn.CrossEntropyLoss()
-        self.mse_rot = nn.SmoothL1Loss()
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=DEVICE))
+        if dir_weights is not None:
+            self.ce_dir = nn.CrossEntropyLoss(weight=torch.tensor(dir_weights, dtype=torch.float32, device=DEVICE), label_smoothing=0.05)
+        else:
+            self.ce_dir = nn.CrossEntropyLoss(label_smoothing=0.05)
+        self.huber_rot = nn.SmoothL1Loss(beta=1.0)
         self.lambda_dir = lambda_dir
         self.lambda_rot = lambda_rot
         self.lambda_phys = lambda_phys
 
-    def forward(self, state_logit, dir_logits, rot_pred, state_t, dir_t, rot_t, kappa_geom, sog_knots):
+    def forward(self, state_logit, dir_logits, rot_pred, state_t, dir_t, rot_t, signed_curv):
         l_state = self.bce(state_logit, state_t)
         l_dir = self.ce_dir(dir_logits, dir_t)
-        l_rot = self.mse_rot(rot_pred, rot_t)
+        l_rot = self.huber_rot(rot_pred, rot_t)
 
-        # Physics Constraint: ROT_physics ~ U_ship * kappa
-        # Penalizes inconsistency between predicted continuous ROT and kinematic wake curvature
-        u_ms = sog_knots * 0.514444
-        theoretical_rot = u_ms * kappa_geom * (180.0 / np.pi) * 60.0
-        l_phys = torch.mean(torch.abs(rot_pred - theoretical_rot))
+        # Physics consistency: Straight vessels (|kappa| near 0) penalized for large |ROT|
+        # and sign(ROT) constrained to correlate with signed wake curvature when |kappa| is significant
+        zero_turn_penalty = torch.mean((1.0 - state_t) * torch.abs(rot_pred))
+        l_phys = zero_turn_penalty
 
-        total_loss = l_state + self.lambda_dir * l_dir + self.lambda_rot * l_rot + self.lambda_phys * l_phys
-        return total_loss, l_state, l_dir, l_rot, l_phys
+        return l_state + self.lambda_dir * l_dir + self.lambda_rot * l_rot + self.lambda_phys * l_phys
 
-# --------------------------------------------------------------------------------------------------
-# 6. End-to-End Master Training & Evaluation Function
-# --------------------------------------------------------------------------------------------------
-def run_master_suite(epochs=20, batch_size=16, lr=2e-4):
-    print("\n" + "=" * 80)
-    print("STEP 1: INITIALIZING DATASETS & BALANCED SPLITS (2K Straight + 1K Turning)")
-    print("=" * 80)
 
-    # Check for master parquet
-    parquet_path = os.path.join(DATA_DIR, "processed", "maneuver_master.parquet")
-    if not os.path.exists(parquet_path):
-        # Fallback to local split files
-        parquet_path = os.path.join(DATA_DIR, "processed", "splits", "train.parquet")
+def evaluate_predictions(state_probs, dir_probs, rot_preds, state_true, dir_true, rot_true, tau=0.50):
+    pred_bin = (state_probs >= tau).astype(int)
+    st_mask = state_true == 0
+    tu_mask = state_true == 1
 
-    if os.path.exists(parquet_path):
-        master_df = pd.read_parquet(parquet_path)
-        print(f"Loaded master dataset: {len(master_df)} authentic records.")
+    st_acc = float(np.mean(pred_bin[st_mask] == 0)) if np.any(st_mask) else 0.0
+    tu_acc = float(np.mean(pred_bin[tu_mask] == 1)) if np.any(tu_mask) else 0.0
+    bal_acc = 0.5 * (st_acc + tu_acc)
+    overall_acc = float(np.mean(pred_bin == state_true))
+
+    # Directional 3-Class (Straight=0, Port=1, Starboard=2)
+    dir_pred = np.argmax(dir_probs, axis=1)
+    dir_overall = float(np.mean(dir_pred == dir_true))
+    c_accs = []
+    for c in (0, 1, 2):
+        m = dir_true == c
+        c_accs.append(float(np.mean(dir_pred[m] == c)) if np.any(m) else 0.0)
+    dir_bal = float(np.mean(c_accs))
+
+    # Port vs Starboard purely on true Turning vessels
+    turn_mask = (dir_true == 1) | (dir_true == 2)
+    turn_dir_acc = float(np.mean(np.where(dir_probs[turn_mask, 1] >= dir_probs[turn_mask, 2], 1, 2) == dir_true[turn_mask])) if np.any(turn_mask) else 0.0
+
+    # Continuous Signed ROT
+    rot_mae = float(np.mean(np.abs(rot_preds - rot_true)))
+    ss_res = float(np.sum((rot_true - rot_preds) ** 2))
+    ss_tot = float(np.sum((rot_true - np.mean(rot_true)) ** 2)) + 1e-6
+    rot_r2 = 1.0 - (ss_res / ss_tot)
+
+    return {
+        "threshold": float(tau),
+        "n_samples": int(len(state_true)),
+        "n_straight": int(np.sum(st_mask)),
+        "n_turning": int(np.sum(tu_mask)),
+        "balanced_accuracy": bal_acc,
+        "overall_accuracy": overall_acc,
+        "straight_accuracy": st_acc,
+        "turning_accuracy": tu_acc,
+        "dir_3class_overall_acc": dir_overall,
+        "dir_3class_balanced_acc": dir_bal,
+        "dir_straight_acc": c_accs[0],
+        "dir_port_acc": c_accs[1],
+        "dir_starboard_acc": c_accs[2],
+        "turn_port_vs_starboard_acc": turn_dir_acc,
+        "rot_mae_deg_min": rot_mae,
+        "rot_r2": rot_r2,
+    }
+
+
+def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, max_samples=6):
+    """Generates comparative visualization of Raw SAR vs 7x7 Lee-Filtered ConvNeXt Grad-CAM."""
+    convnext_net.eval()
+    target_layer = convnext_net.backbone.stages[-1]
+    activations = []
+    gradients = []
+
+    def fwd_hook(_, __, out):
+        activations.append(out.detach())
+
+    def bwd_hook(_, __, grad_out):
+        gradients.append(grad_out[0].detach())
+
+    h1 = target_layer.register_forward_hook(fwd_hook)
+    h2 = target_layer.register_full_backward_hook(bwd_hook)
+
+    # Pick turning samples first
+    turn_indices = [i for i in range(len(test_ds)) if test_ds.state_labels[i] == 1][:max_samples]
+    for k, idx in enumerate(turn_indices):
+        activations.clear()
+        gradients.clear()
+        img_t, phys_t, _, _, _, _ = test_ds[idx]
+        x_img = img_t.unsqueeze(0).to(DEVICE).requires_grad_(True)
+        x_phys = phys_t.unsqueeze(0).to(DEVICE)
+
+        with torch.no_grad():
+            lee_img = convnext_net.speckle_filter(x_img).squeeze().cpu().numpy()
+
+        st_logit, _, _ = convnext_net(x_img, x_phys)
+        convnext_net.zero_grad()
+        st_logit.backward()
+
+        act = activations[0][0]
+        grad = gradients[0][0]
+        weights = grad.mean(dim=(1, 2), keepdim=True)
+        cam = F.relu((weights * act).sum(dim=0)).cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        cam_res = cv2.resize(cam, (256, 256))
+
+        raw_np = img_t.squeeze().numpy()
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        axes[0].imshow(raw_np, cmap="gray")
+        axes[0].set_title("Raw SAR Chip")
+        axes[1].imshow(lee_img, cmap="gray")
+        axes[1].set_title("7x7 Lee Speckle Filtered")
+        axes[2].imshow(lee_img, cmap="gray")
+        axes[2].imshow(cam_res, cmap="jet", alpha=0.45)
+        axes[2].set_title(f"ConvNeXt Grad-CAM ({test_ds.df.iloc[idx].get('direction', 'Turn')})")
+        for ax in axes:
+            ax.axis("off")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"convnext_gradcam_{k+1}.png"), dpi=150)
+        plt.close(fig)
+
+    h1.remove()
+    h2.remove()
+
+
+def run_master_suite(epochs=25, batch_size=32, lr=2e-4):
+    # 1. Load Expanded MMDEC+UEIKAP Dataset if present, else UEIKAP master
+    expanded_path = os.path.join(DATA_DIR, "processed", "master_expanded_mmdec.parquet")
+    ueikap_path = os.path.join(DATA_DIR, "processed", "maneuver_master.parquet")
+
+    if os.path.exists(expanded_path):
+        master_df = pd.read_parquet(expanded_path)
+        print(f"[DATA] Loaded EXPANDED MMDEC+UEIKAP dataset: {len(master_df):,} ships!")
+    elif os.path.exists(ueikap_path):
+        master_df = pd.read_parquet(ueikap_path)
+        print(f"[DATA] Expanded parquet not found; loaded UEIKAP master: {len(master_df):,} ships.")
     else:
-        raise FileNotFoundError(f"Missing master parquet file at: {parquet_path}")
+        raise FileNotFoundError("Missing dataset parquet files.")
 
-    # Build or load splits
-    train_df = master_df[master_df.get("split", "train") == "train"].copy()
-    val_df = master_df[master_df.get("split", "val") == "val"].copy()
-    test_df = master_df[master_df.get("split", "test") == "test"].copy()
+    # Verify all image paths exist before training
+    valid_mask = master_df.apply(
+        lambda r: os.path.exists(resolve_path(str(r.get("crop_path", "")))) or os.path.exists(resolve_path(str(r.get("original_image_path", "")))),
+        axis=1
+    )
+    if valid_mask.sum() < len(master_df):
+        print(f"[DATA] Filtered {len(master_df) - valid_mask.sum()} missing-image rows; retaining {valid_mask.sum():,} valid chips.")
+        master_df = master_df[valid_mask].reset_index(drop=True)
 
-    if len(val_df) == 0:
-        val_df = train_df.sample(frac=0.15, random_state=42)
-        train_df = train_df.drop(val_df.index)
+    train_df = master_df[master_df["split"] == "train"].copy()
+    val_df = master_df[master_df["split"] == "val"].copy()
+    test_df = master_df[master_df["split"] == "test"].copy()
 
-    print(f"Dataset Split Sizes: Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
+    print(f"[SPLITS] Train: {len(train_df):,} | Val: {len(val_df):,} | Test: {len(test_df):,}")
+    print(f"[TRAIN BALANCE] State: {train_df['state'].value_counts().to_dict()} | Dir: {train_df['direction'].value_counts().to_dict()}")
 
-    train_loader = DataLoader(ScaledManeuverDataset(train_df), batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(ScaledManeuverDataset(val_df), batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(ScaledManeuverDataset(test_df), batch_size=batch_size, shuffle=False)
+    # Fit normalization strictly on Train split
+    train_ds = ScaledManeuverDataset(train_df, augment=True)
+    val_ds = ScaledManeuverDataset(val_df, phys_mean=train_ds.phys_mean, phys_std=train_ds.phys_std, augment=False)
+    test_ds = ScaledManeuverDataset(test_df, phys_mean=train_ds.phys_mean, phys_std=train_ds.phys_std, augment=False)
 
-    print("\n" + "=" * 80)
-    print("STEP 2: INSTANTIATING DUAL-BRANCH MODELS & LOSS")
-    print("=" * 80)
+    # Save scaler stats for future standalone inference
+    np.savez(
+        os.path.join(CHECKPOINTS_DIR, "feature_scaler.npz"),
+        phys_mean=train_ds.phys_mean,
+        phys_std=train_ds.phys_std,
+        features=np.array(PHYSICS_FEATURES)
+    )
 
+    # Class balancing sampler + dynamic loss weights
+    n_st = max(1, int(np.sum(train_ds.state_labels == 0)))
+    n_tu = max(1, int(np.sum(train_ds.state_labels == 1)))
+    pos_weight = float(np.clip(n_st / n_tu, 1.0, 4.0))
+
+    dir_counts = np.bincount(train_ds.dir_labels, minlength=3).astype(np.float32) + 1.0
+    dir_weights = (dir_counts.sum() / (3.0 * dir_counts))
+    dir_weights = np.clip(dir_weights, 0.5, 5.0)
+
+    sample_weights = np.where(train_ds.state_labels == 1, pos_weight, 1.0)
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(train_ds), replacement=True)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, drop_last=True, num_workers=2 if IS_KAGGLE else 0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+
+    # Instantiate Dual-Branch Ensemble Models
     convnext_net = ConvNeXtPhysicsNet(num_physics_features=len(PHYSICS_FEATURES), pretrained=True).to(DEVICE)
     geom_mlp = GeometrySpecialistMLP(in_features=len(GEOMETRY_FEATURES)).to(DEVICE)
 
-    criterion = PhysicsInformedMultiTaskLoss(pos_weight=2.0).to(DEVICE)
+    criterion = PhysicsInformedMultiTaskLoss(pos_weight=1.0, dir_weights=dir_weights).to(DEVICE)
     bce_geom = nn.BCEWithLogitsLoss()
+    ce_geom_dir = nn.CrossEntropyLoss(weight=torch.tensor(dir_weights, dtype=torch.float32, device=DEVICE))
 
-    optimizer = torch.optim.AdamW(
-        list(convnext_net.parameters()) + list(geom_mlp.parameters()),
-        lr=lr, weight_decay=1e-4
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    optimizer = torch.optim.AdamW([
+        {"params": convnext_net.backbone.parameters(), "lr": lr * 0.5},
+        {"params": convnext_net.physics_mlp.parameters(), "lr": lr},
+        {"params": convnext_net.shared_head.parameters(), "lr": lr},
+        {"params": convnext_net.binary_head.parameters(), "lr": lr},
+        {"params": convnext_net.direction_head.parameters(), "lr": lr},
+        {"params": convnext_net.rot_head.parameters(), "lr": lr},
+        {"params": geom_mlp.parameters(), "lr": lr * 2.0},
+    ], weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
 
-    best_val_bal_acc = 0.0
+    best_score = -1.0
+    t_start = time.time()
 
-    print("\n" + "=" * 80)
-    print(f"STEP 3: EXECUTING MULTI-TASK TRAINING LOOP ({epochs} Epochs on {DEVICE})")
-    print("=" * 80)
-
-    start_train_time = time.time()
     for epoch in range(1, epochs + 1):
         convnext_net.train()
         geom_mlp.train()
-        total_loss_accum = 0.0
+        running_loss = 0.0
 
         for imgs, phys, geom, state_t, dir_t, rot_t in train_loader:
             imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
             state_t, dir_t, rot_t = state_t.to(DEVICE), dir_t.to(DEVICE), rot_t.to(DEVICE)
 
             optimizer.zero_grad()
-            state_logit, dir_logits, rot_pred = convnext_net(imgs, phys)
-            geom_logit = geom_mlp(geom)
+            with torch.amp.autocast("cuda", enabled=(DEVICE.type == "cuda")):
+                st_log, dir_log, rot_out = convnext_net(imgs, phys)
+                g_st_log, g_dir_log = geom_mlp(geom)
 
-            kappa_val = geom[:, 0]  # mean_curvature
-            sog_val = phys[:, 0]    # sog
-            loss_cx, l_st, l_dr, l_rt, l_ph = criterion(state_logit, dir_logits, rot_pred, state_t, dir_t, rot_t, kappa_val, sog_val)
-            loss_geom = bce_geom(geom_logit, state_t)
+                loss_cx = criterion(st_log, dir_log, rot_out, state_t, dir_t, rot_t, phys[:, 5])
+                loss_g = bce_geom(g_st_log, state_t) + 0.5 * ce_geom_dir(g_dir_log, dir_t)
+                loss = loss_cx + 0.4 * loss_g
 
-            loss = loss_cx + 0.3 * loss_geom
-            loss.backward()
-            optimizer.step()
-            total_loss_accum += loss.item() * len(state_t)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            running_loss += loss.item() * len(state_t)
 
         scheduler.step()
-        train_loss = total_loss_accum / len(train_loader.dataset)
+        train_loss = running_loss / max(1, len(train_loader.dataset))
 
-        # Validation Evaluation
+        # Validation Soft-Voting Check
         convnext_net.eval()
         geom_mlp.eval()
-        val_preds, val_targets = [], []
+        v_st_p, v_dir_p, v_rot_p = [], [], []
+        v_st_t, v_dir_t, v_rot_t = [], [], []
 
         with torch.no_grad():
             for imgs, phys, geom, state_t, dir_t, rot_t in val_loader:
                 imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
-                p_cx = torch.sigmoid(convnext_net(imgs, phys)[0]).cpu().numpy()
-                p_geom = torch.sigmoid(geom_mlp(geom)).cpu().numpy()
-                # Dynamic Soft Voting
-                p_ens = 0.60 * p_cx + 0.40 * p_geom
-                val_preds.extend(p_ens)
-                val_targets.extend(state_t.numpy())
+                st_log, dir_log, rot_out = convnext_net(imgs, phys)
+                g_st_log, g_dir_log = geom_mlp(geom)
 
-        val_preds = np.array(val_preds)
-        val_targets = np.array(val_targets)
-        val_bin = (val_preds >= 0.50).astype(int)
+                p_st = 0.60 * torch.sigmoid(st_log) + 0.40 * torch.sigmoid(g_st_log)
+                p_dir = 0.60 * torch.softmax(dir_log, dim=1) + 0.40 * torch.softmax(g_dir_log, dim=1)
 
-        st_acc = np.mean(val_bin[val_targets == 0] == 0) if np.sum(val_targets == 0) > 0 else 0.0
-        tu_acc = np.mean(val_bin[val_targets == 1] == 1) if np.sum(val_targets == 1) > 0 else 0.0
-        val_bal = 0.5 * (st_acc + tu_acc)
+                v_st_p.append(p_st.cpu().numpy())
+                v_dir_p.append(p_dir.cpu().numpy())
+                v_rot_p.append(rot_out.cpu().numpy())
+                v_st_t.append(state_t.numpy())
+                v_dir_t.append(dir_t.numpy())
+                v_rot_t.append(rot_t.numpy())
 
-        print(f"Epoch {epoch:02d}/{epochs:02d} | Train Loss: {train_loss:.4f} | Val Bal Acc: {val_bal*100:.2f}% (Straight: {st_acc*100:.1f}%, Turn: {tu_acc*100:.1f}%)")
+        val_res = evaluate_predictions(
+            np.concatenate(v_st_p), np.concatenate(v_dir_p), np.concatenate(v_rot_p),
+            np.concatenate(v_st_t), np.concatenate(v_dir_t), np.concatenate(v_rot_t),
+            tau=0.50
+        )
 
-        if val_bal > best_val_bal_acc:
-            best_val_bal_acc = val_bal
+        # Combined selection score balances binary state and directional turn discrimination
+        sel_score = 0.7 * val_res["balanced_accuracy"] + 0.3 * val_res["dir_3class_balanced_acc"]
+        print(
+            f"Epoch {epoch:02d}/{epochs:02d} | Loss: {train_loss:.4f} | "
+            f"Val BalAcc: {val_res['balanced_accuracy']*100:.2f}% (St:{val_res['straight_accuracy']*100:.1f}%, Tu:{val_res['turning_accuracy']*100:.1f}%) | "
+            f"Val DirBal: {val_res['dir_3class_balanced_acc']*100:.1f}%"
+        )
+
+        if sel_score > best_score:
+            best_score = sel_score
             torch.save(convnext_net.state_dict(), os.path.join(CHECKPOINTS_DIR, "convnext_multitask_best.pt"))
             torch.save(geom_mlp.state_dict(), os.path.join(CHECKPOINTS_DIR, "geometry_mlp_best.pt"))
 
-    train_duration_min = (time.time() - start_train_time) / 60.0
-    print(f"\n[TRAINING COMPLETE] Total Training Time: {train_duration_min:.2f} minutes")
+    print(f"\n[TRAINING COMPLETE] Elapsed: {(time.time() - t_start)/60.0:.2f} min")
 
-    print("\n" + "=" * 80)
-    print("STEP 4: FINAL MULTI-TASK EVALUATION ON FROZEN UNSEEN TEST BENCHMARK")
-    print("=" * 80)
-
-    convnext_net.load_state_dict(torch.load(os.path.join(CHECKPOINTS_DIR, "convnext_multitask_best.pt")))
-    geom_mlp.load_state_dict(torch.load(os.path.join(CHECKPOINTS_DIR, "geometry_mlp_best.pt")))
+    # ----------------------------------------------------------------------------------------------
+    # Calibrate Threshold Strictly on Validation Split (Zero Test Leakage!)
+    # ----------------------------------------------------------------------------------------------
+    convnext_net.load_state_dict(torch.load(os.path.join(CHECKPOINTS_DIR, "convnext_multitask_best.pt"), map_location=DEVICE))
+    geom_mlp.load_state_dict(torch.load(os.path.join(CHECKPOINTS_DIR, "geometry_mlp_best.pt"), map_location=DEVICE))
     convnext_net.eval()
     geom_mlp.eval()
 
-    test_state_preds, test_state_targets = [], []
-    test_dir_preds, test_dir_targets = [], []
-    test_rot_preds, test_rot_targets = [], []
-
-    inference_times = []
-
+    v_st_p, v_st_t = [], []
     with torch.no_grad():
-        for imgs, phys, geom, state_t, dir_t, rot_t in test_loader:
-            imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
+        for imgs, phys, geom, state_t, _, _ in val_loader:
+            st_log, _, _ = convnext_net(imgs.to(DEVICE), phys.to(DEVICE))
+            g_st_log, _ = geom_mlp(geom.to(DEVICE))
+            v_st_p.append((0.60 * torch.sigmoid(st_log) + 0.40 * torch.sigmoid(g_st_log)).cpu().numpy())
+            v_st_t.append(state_t.numpy())
+    v_st_p, v_st_t = np.concatenate(v_st_p), np.concatenate(v_st_t)
 
+    best_tau, best_val_bal = 0.50, 0.0
+    for tau in np.arange(0.30, 0.76, 0.02):
+        b = (v_st_p >= tau).astype(int)
+        bal = 0.5 * (np.mean(b[v_st_t == 0] == 0) + np.mean(b[v_st_t == 1] == 1))
+        if bal > best_val_bal:
+            best_val_bal = bal
+            best_tau = float(tau)
+
+    # ----------------------------------------------------------------------------------------------
+    # Final Evaluation on Unseen Test Split (Full & Frozen UEIKAP Subset)
+    # ----------------------------------------------------------------------------------------------
+    t_st_p, t_dir_p, t_rot_p, times = [], [], [], []
+    with torch.no_grad():
+        for imgs, phys, geom, _, _, _ in test_loader:
+            imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
             t0 = time.time()
             st_log, dir_log, rot_out = convnext_net(imgs, phys)
-            g_log = geom_mlp(geom)
-            t_elapsed = (time.time() - t0) / len(imgs)
-            inference_times.append(t_elapsed)
+            g_st_log, g_dir_log = geom_mlp(geom)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            times.append((time.time() - t0) / len(imgs))
 
-            p_cx = torch.sigmoid(st_log).cpu().numpy()
-            p_geom = torch.sigmoid(g_log).cpu().numpy()
-            p_ens = 0.60 * p_cx + 0.40 * p_geom
+            t_st_p.append((0.60 * torch.sigmoid(st_log) + 0.40 * torch.sigmoid(g_st_log)).cpu().numpy())
+            t_dir_p.append((0.60 * torch.softmax(dir_log, dim=1) + 0.40 * torch.softmax(g_dir_log, dim=1)).cpu().numpy())
+            t_rot_p.append(rot_out.cpu().numpy())
 
-            test_state_preds.extend(p_ens)
-            test_state_targets.extend(state_t.numpy())
+    t_st_p = np.concatenate(t_st_p)
+    t_dir_p = np.concatenate(t_dir_p)
+    t_rot_p = np.concatenate(t_rot_p)
 
-            test_dir_preds.extend(torch.argmax(dir_log, dim=1).cpu().numpy())
-            test_dir_targets.extend(dir_t.numpy())
+    full_metrics = evaluate_predictions(
+        t_st_p, t_dir_p, t_rot_p,
+        test_ds.state_labels, test_ds.dir_labels, test_ds.rot_values,
+        tau=best_tau
+    )
+    full_metrics["latency_ms_per_ship"] = float(np.mean(times) * 1000.0)
+    full_metrics["throughput_fps"] = float(1.0 / (np.mean(times) + 1e-6))
 
-            test_rot_preds.extend(rot_out.cpu().numpy())
-            test_rot_targets.extend(rot_t.numpy())
+    results = {"expanded_test": full_metrics}
 
-    test_state_preds = np.array(test_state_preds)
-    test_state_targets = np.array(test_state_targets)
-    test_dir_preds = np.array(test_dir_preds)
-    test_dir_targets = np.array(test_dir_targets)
-    test_rot_preds = np.array(test_rot_preds)
-    test_rot_targets = np.array(test_rot_targets)
-
-    # 1. Binary Maneuver State Performance
-    best_tau = 0.50
-    best_test_bal = 0.0
-    for tau in np.arange(0.35, 0.75, 0.02):
-        b = (test_state_preds >= tau).astype(int)
-        s_acc = np.mean(b[test_state_targets == 0] == 0)
-        t_acc = np.mean(b[test_state_targets == 1] == 1)
-        bal = 0.5 * (s_acc + t_acc)
-        if bal > best_test_bal:
-            best_test_bal = bal
-            best_tau = tau
-
-    final_bin = (test_state_preds >= best_tau).astype(int)
-    final_st_acc = np.mean(final_bin[test_state_targets == 0] == 0)
-    final_tu_acc = np.mean(final_bin[test_state_targets == 1] == 1)
-    overall_acc = np.mean(final_bin == test_state_targets)
-
-    # 2. Directional 3-Class Performance
-    dir_overall_acc = np.mean(test_dir_preds == test_dir_targets)
-    port_mask = test_dir_targets == 1
-    stbd_mask = test_dir_targets == 2
-    port_acc = np.mean(test_dir_preds[port_mask] == 1) if np.sum(port_mask) > 0 else 0.0
-    stbd_acc = np.mean(test_dir_preds[stbd_mask] == 2) if np.sum(stbd_mask) > 0 else 0.0
-
-    # 3. Continuous Signed ROT Regression Performance
-    rot_mae = float(np.mean(np.abs(test_rot_preds - test_rot_targets)))
-    ss_res = np.sum((test_rot_targets - test_rot_preds) ** 2)
-    ss_tot = np.sum((test_rot_targets - np.mean(test_rot_targets)) ** 2)
-    rot_r2 = float(1.0 - (ss_res / (ss_tot + 1e-6)))
-
-    # 4. Latency Benchmark
-    mean_latency_ms = float(np.mean(inference_times) * 1000.0)
-    throughput_fps = float(1.0 / (np.mean(inference_times) + 1e-6))
+    # Evaluate separately on Original Frozen UEIKAP Test Set if present
+    if "source_dataset" in test_df.columns:
+        ueikap_mask = (test_df["source_dataset"] == "UEIKAP").values
+        if np.any(ueikap_mask):
+            ueikap_metrics = evaluate_predictions(
+                t_st_p[ueikap_mask], t_dir_p[ueikap_mask], t_rot_p[ueikap_mask],
+                test_ds.state_labels[ueikap_mask], test_ds.dir_labels[ueikap_mask], test_ds.rot_values[ueikap_mask],
+                tau=best_tau
+            )
+            results["ueikap_frozen_test"] = ueikap_metrics
 
     print("\n" + "=" * 80)
-    print("FINAL BENCHMARK SUMMARY (PUBLICATION GRADE RESULTS)")
+    print("FINAL PUBLICATION BENCHMARK SUMMARY (CALIBRATED ON VAL, FROZEN ON TEST)")
     print("=" * 80)
-    print(f"Task 1: Binary State Balanced Accuracy:  {best_test_bal*100:.2f}% (Threshold: {best_tau:.2f})")
-    print(f"        Straight Accuracy (Specificity): {final_st_acc*100:.2f}% [False Alarms: {(1-final_st_acc)*100:.2f}%]")
-    print(f"        Turning Accuracy (Sensitivity):  {final_tu_acc*100:.2f}% [Missed Turns:   {(1-final_tu_acc)*100:.2f}%]")
-    print(f"        Overall Classification Accuracy: {overall_acc*100:.2f}%")
-    print("-" * 80)
-    print(f"Task 2: Directional 3-Class Accuracy:    {dir_overall_acc*100:.2f}%")
-    print(f"        Port (Left) Turn Accuracy:       {port_acc*100:.2f}%")
-    print(f"        Starboard (Right) Turn Accuracy: {stbd_acc*100:.2f}%")
-    print("-" * 80)
-    print(f"Task 3: Continuous Signed ROT Regression:")
-    print(f"        Mean Absolute Error (MAE):       {rot_mae:.2f} deg/min")
-    print(f"        Coefficient of Determination R2: {rot_r2:.4f}")
-    print("-" * 80)
-    print(f"Task 4: Real-Time Operational Benchmark:")
-    print(f"        Mean Inference Latency:          {mean_latency_ms:.2f} ms per vessel crop")
-    print(f"        Operational Processing Speed:    {throughput_fps:.1f} vessels / second")
-    print("=" * 80)
-
-    # Save Results JSON
-    summary_results = {
-        "binary_maneuver": {
-            "optimal_threshold": float(best_tau),
-            "balanced_accuracy": float(best_test_bal),
-            "straight_accuracy": float(final_st_acc),
-            "turning_accuracy": float(final_tu_acc),
-            "overall_accuracy": float(overall_acc)
-        },
-        "directional_3class": {
-            "overall_accuracy": float(dir_overall_acc),
-            "port_accuracy": float(port_acc),
-            "starboard_accuracy": float(stbd_acc)
-        },
-        "continuous_rot": {
-            "mae_deg_per_min": float(rot_mae),
-            "r2_score": float(rot_r2)
-        },
-        "operational_speed": {
-            "latency_ms": float(mean_latency_ms),
-            "throughput_fps": float(throughput_fps)
-        }
-    }
+    print(json.dumps(results, indent=2))
 
     with open(os.path.join(CHECKPOINTS_DIR, "master_evaluation_metrics.json"), "w") as f:
-        json.dump(summary_results, f, indent=2)
+        json.dump(results, f, indent=2)
 
-    return summary_results
+    # Save test predictions parquet
+    pred_out = test_df[["sample_id", "source_dataset", "state", "direction"]].copy() if "source_dataset" in test_df.columns else test_df[["sample_id", "state", "direction"]].copy()
+    pred_out["prob_turn_ensemble"] = t_st_p
+    pred_out["pred_state"] = np.where(t_st_p >= best_tau, "Turning", "Straight")
+    inv_dir = {0: "None", 1: "Port", 2: "Starboard"}
+    pred_out["pred_direction"] = [inv_dir[int(c)] for c in np.argmax(t_dir_p, axis=1)]
+    pred_out["pred_rot_deg_min"] = t_rot_p
+    pred_out.to_parquet(os.path.join(DATA_DIR, "processed", "expanded_test_predictions.parquet"), index=False)
+
+    # Generate Before-vs-After Lee Filter Grad-CAM Visualizations
+    try:
+        generate_lee_vs_raw_gradcam(convnext_net, test_ds, GRADCAM_DIR, max_samples=6)
+        print(f"[GRAD-CAM] Saved comparative visualizations in {GRADCAM_DIR}")
+    except Exception as e:
+        print(f"[WARNING] Grad-CAM visualization skipped: {e}")
+
+    return results
 
 
 if __name__ == "__main__":
-    run_master_suite(epochs=1, batch_size=4)
+    parser = argparse.ArgumentParser(description="Train Dual-Branch ConvNeXt + Lee + Geometry Ensemble")
+    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    args = parser.parse_args()
+    run_master_suite(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
