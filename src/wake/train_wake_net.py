@@ -6,8 +6,10 @@ Centerline Fitting and Multi-Window Angular Curvature Analysis.
 """
 
 import os
+import sys
 import json
 import argparse
+import subprocess
 import numpy as np
 import pandas as pd
 import torch
@@ -15,12 +17,36 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import cv2
 from skimage.morphology import remove_small_objects
-import segmentation_models_pytorch as smp
+try:
+    import segmentation_models_pytorch as smp
+except ImportError:
+    if os.path.exists("/kaggle/working"):
+        print("[WAKE-NET] Installing missing 'segmentation-models-pytorch' on Kaggle...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "segmentation-models-pytorch"])
+        import segmentation_models_pytorch as smp
+    else:
+        raise
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CHECKPOINTS_DIR = os.path.join(PROJECT_ROOT, "checkpoints", "wake_net")
 PACKAGE_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "wake_segmentation_kaggle")
 LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
+
+
+def preprocess_sar_logdb_clahe(img_gray, clahe=None, out_size=(384, 384)):
+    """Log-dB percentile SAR contrast stretch [p1, p99.5] + CLAHE normalizing dark UEIKAP & MMDEC chips."""
+    if out_size is not None and (img_gray.shape[1], img_gray.shape[0]) != tuple(out_size):
+        img_gray = cv2.resize(img_gray, out_size)
+    log_g = np.log1p(img_gray.astype(np.float32))
+    lo, hi = np.percentile(log_g, [1.0, 99.5])
+    if hi - lo > 1e-4:
+        stretched = np.clip((log_g - lo) / (hi - lo), 0.0, 1.0)
+    else:
+        stretched = img_gray.astype(np.float32) / 255.0
+    u8 = (stretched * 255.0).astype(np.uint8)
+    if clahe is None:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(u8)
 
 
 class WakeDataset(Dataset):
@@ -43,8 +69,7 @@ class WakeDataset(Dataset):
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise FileNotFoundError(f"Missing SAR image: {img_path}")
-        img = cv2.resize(img, self.img_size)
-        img = self.clahe.apply(img)
+        img = preprocess_sar_logdb_clahe(img, clahe=self.clahe, out_size=self.img_size)
 
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is None:

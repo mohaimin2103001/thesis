@@ -32,7 +32,7 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from geometry.wake_geometry import extract_wake_features_from_mask
-from wake.train_wake_net import build_wake_net_model, compute_radon_wake_kinematics
+from wake.train_wake_net import build_wake_net_model, compute_radon_wake_kinematics, preprocess_sar_logdb_clahe
 
 MMDEC_DIR = os.path.join(PROJECT_ROOT, "data", "raw", "mmdec")
 PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
@@ -527,7 +527,7 @@ def run_mmdec_harvest_and_mask(
         imgs = []
         for p in batch_paths:
             g = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
-            g_res = clahe.apply(cv2.resize(g, (384, 384))).astype(np.float32) / 255.0
+            g_res = preprocess_sar_logdb_clahe(g, clahe=clahe, out_size=(384, 384)).astype(np.float32) / 255.0
             imgs.append(g_res)
         batch_t = torch.from_numpy(np.array(imgs)).unsqueeze(1).to(device)
 

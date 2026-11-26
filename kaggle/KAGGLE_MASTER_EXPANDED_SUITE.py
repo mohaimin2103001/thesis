@@ -140,7 +140,7 @@ def resolve_path(p):
 # Adaptive 7x7 Lee Speckle Filter + Dual-Branch Architectures
 # --------------------------------------------------------------------------------------------------
 class LeeSpeckleFilter(nn.Module):
-    """Differentiable 7x7 Lee filter suppressing multiplicative SAR sea clutter speckle."""
+    """Differentiable FP32 7x7 Lee filter suppressing multiplicative SAR sea clutter speckle."""
     def __init__(self, kernel_size=7, noise_var=0.08):
         super().__init__()
         self.pad = kernel_size // 2
@@ -149,18 +149,21 @@ class LeeSpeckleFilter(nn.Module):
         self.register_buffer("box_weight", box_weight)
 
     def forward(self, x):
-        mean = F.conv2d(x, self.box_weight, padding=self.pad)
-        sq_mean = F.conv2d(x * x, self.box_weight, padding=self.pad)
-        var = torch.clamp(sq_mean - mean * mean, min=1e-6)
-        # Local adaptive gain K in [0, 1]
-        k = torch.clamp((var - (mean * mean) * self.noise_var) / var, min=0.0, max=1.0)
-        return torch.clamp(mean + k * (x - mean), 0.0, 1.0)
+        # Strictly run local variance estimation in FP32 to avoid AMP FP16 cancellation
+        with torch.amp.autocast("cuda", enabled=False):
+            xf = x.float()
+            w = self.box_weight.float()
+            mean = F.conv2d(xf, w, padding=self.pad)
+            sq_mean = F.conv2d(xf * xf, w, padding=self.pad)
+            var = torch.clamp(sq_mean - mean * mean, min=1e-6)
+            k = torch.clamp((var - (mean * mean) * self.noise_var) / var, min=0.0, max=1.0)
+            return torch.clamp(mean + k * (xf - mean), 0.0, 1.0)
 
 
 class ConvNeXtPhysicsNet(nn.Module):
     """
-    Branch A (Method 3): Adaptive 7x7 Lee Filter + ConvNeXt-Tiny + 12 Wake/Radon Geometry Features.
-    Outputs Multi-Task Heads: Binary State Logit, 3-Class Direction Logits, Continuous Signed ROT.
+    Branch A (Method 3): FP32 7x7 Lee Filter + ConvNeXt-Tiny + 12 Wake/Radon Geometry Features.
+    Outputs Multi-Task Heads: Binary State Logit, 3-Class Direction Logits, Continuous Signed ROT, Turning Port/Stbd Logit.
     """
     def __init__(self, num_physics_features=12, pretrained=True):
         super().__init__()
@@ -170,8 +173,8 @@ class ConvNeXtPhysicsNet(nn.Module):
             pretrained=pretrained,
             num_classes=0,
             in_chans=3,
-            drop_rate=0.25,
-            drop_path_rate=0.20,
+            drop_rate=0.10,
+            drop_path_rate=0.10,
         )
         embed_dim = self.backbone.num_features  # 768
 
@@ -180,18 +183,18 @@ class ConvNeXtPhysicsNet(nn.Module):
 
         self.physics_mlp = nn.Sequential(
             nn.Linear(num_physics_features, 64),
-            nn.BatchNorm1d(64),
+            nn.LayerNorm(64),
             nn.SiLU(),
-            nn.Dropout(0.20),
+            nn.Dropout(0.10),
             nn.Linear(64, 64),
             nn.SiLU()
         )
 
         self.shared_head = nn.Sequential(
             nn.Linear(embed_dim + 64, 160),
-            nn.BatchNorm1d(160),
+            nn.LayerNorm(160),
             nn.SiLU(),
-            nn.Dropout(0.30)
+            nn.Dropout(0.15)
         )
 
         self.binary_head = nn.Linear(160, 1)
@@ -200,12 +203,14 @@ class ConvNeXtPhysicsNet(nn.Module):
         self.rot_head = nn.Linear(160, 1)
 
     def forward(self, x_img, x_phys):
-        # x_img: (B, 2, H, W) -> Ch 0 = SAR grayscale, Ch 1 = Wake-Net Mask
-        sar_ch = x_img[:, 0:1]
-        mask_ch = x_img[:, 1:2]
-        lee_ch = self.speckle_filter(sar_ch)
-        # 3-channel physics-guided tensor: [Lee-filtered SAR, Contrast SAR, Wake Mask Spotlight]
-        x_raw3 = torch.cat([lee_ch, sar_ch, mask_ch], dim=1)
+        # Accepts 3-ch [log_sar, clahe_sar, blur_mask] or 2-ch [sar, mask]
+        log_ch = x_img[:, 0:1]
+        clahe_ch = x_img[:, 1:2] if x_img.shape[1] >= 3 else log_ch
+        mask_ch = x_img[:, 2:3] if x_img.shape[1] >= 3 else x_img[:, 1:2]
+        lee_ch = self.speckle_filter(log_ch)
+        # Smooth wake spotlight avoids binary step-edge gradient spikes in stage 0
+        spot_ch = torch.clamp(0.55 * clahe_ch.float() + 0.45 * mask_ch.float(), 0.0, 1.0)
+        x_raw3 = torch.cat([lee_ch, clahe_ch.float(), spot_ch], dim=1)
         x_3ch = (x_raw3 - self.img_mean) / self.img_std
         v_emb = self.backbone(x_3ch)
         p_emb = self.physics_mlp(x_phys)
@@ -221,15 +226,15 @@ class ConvNeXtPhysicsNet(nn.Module):
 class GeometrySpecialistMLP(nn.Module):
     """
     Branch B (Method 1 Anchor / Model 3): Pure Wake Curvature & Radon Specialist.
-    Acts as a mathematical veto against sea-clutter visual false positives.
+    Uses LayerNorm for small-batch stability across sparse/unmasked rows.
     """
     def __init__(self, in_features=7):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_features, 64),
-            nn.BatchNorm1d(64),
+            nn.LayerNorm(64),
             nn.SiLU(),
-            nn.Dropout(0.20),
+            nn.Dropout(0.15),
             nn.Linear(64, 32),
             nn.SiLU(),
         )
@@ -298,15 +303,25 @@ class ScaledManeuverDataset(Dataset):
         img = cv2.imread(img_p, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise FileNotFoundError(f"Could not load SAR chip for sample {row.get('sample_id')}: {img_p}")
-        img = self.clahe.apply(cv2.resize(img, self.img_size))
+        img_res = cv2.resize(img, self.img_size)
 
-        # Load Wake-Net / GT segmented wake mask as 2nd channel spotlight
+        # Log-dB percentile normalization [p1, p99.5] maps dark UEIKAP [4..12] and MMDEC into [0, 1]
+        log_g = np.log1p(img_res.astype(np.float32))
+        lo, hi = np.percentile(log_g, [1.0, 99.5])
+        if hi - lo > 1e-4:
+            log_n = np.clip((log_g - lo) / (hi - lo), 0.0, 1.0)
+        else:
+            log_n = img_res.astype(np.float32) / 255.0
+        clahe_n = self.clahe.apply((log_n * 255.0).astype(np.uint8)).astype(np.float32) / 255.0
+
+        # Load Wake-Net / GT segmented wake mask & smooth slightly to avoid step-edge grad explosion
         m_path = resolve_path(str(row.get("wake_mask_path", "")))
         if os.path.exists(m_path):
             m_img = cv2.imread(m_path, cv2.IMREAD_GRAYSCALE)
             mask = cv2.resize(m_img, self.img_size, interpolation=cv2.INTER_NEAREST) if m_img is not None else np.zeros(self.img_size, dtype=np.uint8)
         else:
             mask = np.zeros(self.img_size, dtype=np.uint8)
+        mask_blur = cv2.GaussianBlur((mask > 127).astype(np.float32), (9, 9), 2.5)
 
         phys_vec = self.phys_raw[idx].copy()
         dir_val = int(self.dir_labels[idx])
@@ -315,8 +330,9 @@ class ScaledManeuverDataset(Dataset):
         if self.augment:
             # Physical horizontal mirror augmentation: swaps Port (1) <-> Starboard (2) and negates chiral physics!
             if np.random.rand() < 0.5:
-                img = np.fliplr(img).copy()
-                mask = np.fliplr(mask).copy()
+                log_n = np.fliplr(log_n).copy()
+                clahe_n = np.fliplr(clahe_n).copy()
+                mask_blur = np.fliplr(mask_blur).copy()
                 if dir_val == 1:
                     dir_val = 2
                 elif dir_val == 2:
@@ -326,13 +342,14 @@ class ScaledManeuverDataset(Dataset):
                     phys_vec[ci] = -phys_vec[ci]
             if np.random.rand() < 0.4:
                 gamma = np.random.uniform(0.90, 1.10)
-                img = np.clip(img.astype(np.float32) * gamma, 0, 255).astype(np.uint8)
+                log_n = np.clip(log_n * gamma, 0.0, 1.0)
+                clahe_n = np.clip(clahe_n * gamma, 0.0, 1.0)
 
         phys_norm_vec = np.clip((phys_vec - self.phys_mean) / self.phys_std, -8.0, 8.0).astype(np.float32)
         geom_norm_vec = phys_norm_vec[self.geom_indices]
 
-        img_2ch = np.stack([img.astype(np.float32) / 255.0, (mask > 127).astype(np.float32)], axis=0)
-        img_t = torch.from_numpy(img_2ch)
+        img_3ch = np.stack([log_n, clahe_n, mask_blur], axis=0).astype(np.float32)
+        img_t = torch.from_numpy(img_3ch)
         phys_t = torch.from_numpy(phys_norm_vec)
         geom_t = torch.from_numpy(geom_norm_vec)
         state_t = torch.tensor(self.state_labels[idx], dtype=torch.float32)
@@ -811,7 +828,7 @@ def train_and_predict_hgb(train_ds, eval_datasets):
     return outputs
 
 
-def run_master_suite(epochs=35, batch_size=16, lr=2e-4, img_size=384, gradcam_per_class=-1):
+def run_master_suite(epochs=35, batch_size=16, lr=2e-4, img_size=384, gradcam_per_class=-1, allow_partial_data=False):
     # 1. Load Expanded MMDEC+UEIKAP Dataset if present, else UEIKAP master
     expanded_path = os.path.join(DATA_DIR, "processed", "master_expanded_mmdec.parquet")
     ueikap_path = os.path.join(DATA_DIR, "processed", "maneuver_master.parquet")
@@ -831,7 +848,13 @@ def run_master_suite(epochs=35, batch_size=16, lr=2e-4, img_size=384, gradcam_pe
         axis=1
     )
     if valid_mask.sum() < len(master_df):
-        print(f"[DATA] Filtered {len(master_df) - valid_mask.sum()} missing-image rows; retaining {valid_mask.sum():,} valid chips.")
+        missing_n = int(len(master_df) - valid_mask.sum())
+        if not allow_partial_data and len(master_df) > 1000 and valid_mask.sum() < 0.5 * len(master_df):
+            raise RuntimeError(
+                f"{missing_n} / {len(master_df)} crops are missing (did Stage 2 mmdec_extract_and_mask fail?). "
+                f"Re-run Stage 2 after installing dependencies, or pass --allow_partial_data."
+            )
+        print(f"[DATA] Filtered {missing_n} missing-image rows; retaining {valid_mask.sum():,} valid chips.")
         master_df = master_df[valid_mask].reset_index(drop=True)
 
     train_df = master_df[master_df["split"] == "train"].copy()
@@ -880,13 +903,13 @@ def run_master_suite(epochs=35, batch_size=16, lr=2e-4, img_size=384, gradcam_pe
 
     # Decoupled optimizers: ConvNeXt (warmup + cosine) & Geometry MLP (FP32)
     opt_cx = torch.optim.AdamW([
-        {"params": convnext_net.backbone.parameters(), "lr": lr * 0.4},
-        {"params": convnext_net.physics_mlp.parameters(), "lr": lr * 1.2},
-        {"params": convnext_net.shared_head.parameters(), "lr": lr * 1.2},
-        {"params": convnext_net.binary_head.parameters(), "lr": lr * 1.2},
-        {"params": convnext_net.direction_head.parameters(), "lr": lr * 1.2},
-        {"params": convnext_net.turn_lr_head.parameters(), "lr": lr * 1.2},
-        {"params": convnext_net.rot_head.parameters(), "lr": lr * 1.2},
+        {"params": convnext_net.backbone.parameters(), "lr": lr * 0.5},
+        {"params": convnext_net.physics_mlp.parameters(), "lr": lr * 2.5},
+        {"params": convnext_net.shared_head.parameters(), "lr": lr * 2.5},
+        {"params": convnext_net.binary_head.parameters(), "lr": lr * 2.5},
+        {"params": convnext_net.direction_head.parameters(), "lr": lr * 2.5},
+        {"params": convnext_net.turn_lr_head.parameters(), "lr": lr * 2.5},
+        {"params": convnext_net.rot_head.parameters(), "lr": lr * 2.5},
     ], weight_decay=1e-4)
     warmup_epochs = min(3, max(1, epochs // 10))
 
@@ -922,7 +945,7 @@ def run_master_suite(epochs=35, batch_size=16, lr=2e-4, img_size=384, gradcam_pe
                 loss_cx = criterion(st_log, dir_log, rot_out, lr_log, state_t, dir_t, rot_t)
             scaler.scale(loss_cx).backward()
             scaler.unscale_(opt_cx)
-            torch.nn.utils.clip_grad_norm_(convnext_net.parameters(), max_norm=2.0)
+            torch.nn.utils.clip_grad_norm_(convnext_net.parameters(), max_norm=5.0)
             scaler.step(opt_cx)
             scaler.update()
 
@@ -933,7 +956,7 @@ def run_master_suite(epochs=35, batch_size=16, lr=2e-4, img_size=384, gradcam_pe
             loss_g_lr = bce_geom_lr(g_lr_log[turn_m], (dir_t[turn_m] == 2).float()) if torch.any(turn_m) else (g_st_log.sum() * 0.0)
             loss_g = bce_geom(g_st_log, state_t) + 0.5 * ce_geom_dir(g_dir_log, dir_t) + 0.5 * loss_g_lr
             loss_g.backward()
-            torch.nn.utils.clip_grad_norm_(geom_mlp.parameters(), max_norm=2.0)
+            torch.nn.utils.clip_grad_norm_(geom_mlp.parameters(), max_norm=5.0)
             opt_geom.step()
 
             running_cx_loss += loss_cx.item() * len(state_t)
@@ -1175,5 +1198,6 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--img_size", type=int, default=384)
     parser.add_argument("--gradcam_per_class", type=int, default=-1, help="-1 generates Grad-CAM for ALL test images")
+    parser.add_argument("--allow_partial_data", action="store_true", help="Allow running without full MMDEC crops")
     args = parser.parse_args()
-    run_master_suite(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, img_size=args.img_size, gradcam_per_class=args.gradcam_per_class)
+    run_master_suite(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, img_size=args.img_size, gradcam_per_class=args.gradcam_per_class, allow_partial_data=args.allow_partial_data)
