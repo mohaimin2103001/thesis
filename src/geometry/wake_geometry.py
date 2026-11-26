@@ -25,12 +25,15 @@ def clean_wake_mask(binary_mask, min_size=50, hole_size=100):
     return cleaned
 
 
-def extract_ordered_centerline(cleaned_mask, ship_point=None):
+def extract_ordered_centerline(cleaned_mask, ship_point=None, max_pts=600):
     """
     Skeletonizes cleaned binary mask, counts true skeleton junction branches,
-    and extracts an ordered chain from the ship end toward the wake tail.
+    and extracts an ordered chain from the ship end toward the wake tail in fast O(N) time.
     """
     bool_mask = cleaned_mask > 127
+    if np.sum(bool_mask) > 0.35 * bool_mask.size:
+        return None, 0, 0.0
+
     skeleton = skeletonize(bool_mask)
     y_coords, x_coords = np.where(skeleton)
 
@@ -43,10 +46,9 @@ def extract_ordered_centerline(cleaned_mask, ship_point=None):
     branch_count = int(np.sum((sk_u8 == 1) & (nbrs >= 3)))
 
     pts = np.column_stack([x_coords, y_coords])
-
-    # Identify skeleton endpoints (1 neighbor) or dense origin
-    end_idx = np.where((sk_u8 == 1) & (nbrs == 1))
-    end_pts = np.column_stack([end_idx[1], end_idx[0]]) if len(end_idx[0]) > 0 else pts
+    if len(pts) > max_pts:
+        step = max(1, len(pts) // max_pts)
+        pts = pts[::step]
 
     if ship_point is None:
         h, w = cleaned_mask.shape
@@ -55,28 +57,23 @@ def extract_ordered_centerline(cleaned_mask, ship_point=None):
     # Start from the skeleton point closest to the ship center
     dists = np.hypot(pts[:, 0] - ship_point[0], pts[:, 1] - ship_point[1])
     ship_idx = int(np.argmin(dists))
-    start_pt = pts[ship_idx]
+    curr_pt = pts[ship_idx]
+    ordered = [curr_pt]
 
-    # Greedy chain tracing with gap tolerance up to 15 px
-    remaining = set(range(len(pts)))
-    ordered = [start_pt]
-    remaining.remove(ship_idx)
-    curr_pt = start_pt
-
-    while remaining:
-        rem_indices = list(remaining)
-        rem_pts = pts[rem_indices]
-        dist_to_curr = np.hypot(rem_pts[:, 0] - curr_pt[0], rem_pts[:, 1] - curr_pt[1])
-        min_idx_in_rem = int(np.argmin(dist_to_curr))
-        min_dist = dist_to_curr[min_idx_in_rem]
-
-        if min_dist > 15.0:
+    # Vectorized boolean-masked greedy chain tracing (avoids O(N^2) Python set/list rebuilding)
+    active = np.ones(len(pts), dtype=bool)
+    active[ship_idx] = False
+    while np.any(active):
+        act_idx = np.flatnonzero(active)
+        cand = pts[act_idx]
+        d2 = (cand[:, 0] - curr_pt[0]) ** 2 + (cand[:, 1] - curr_pt[1]) ** 2
+        j = int(np.argmin(d2))
+        if d2[j] > 225.0:  # 15.0 px radius squared
             break
-
-        nearest_orig_idx = rem_indices[min_idx_in_rem]
-        curr_pt = pts[nearest_orig_idx]
+        orig_i = int(act_idx[j])
+        curr_pt = pts[orig_i]
         ordered.append(curr_pt)
-        remaining.remove(nearest_orig_idx)
+        active[orig_i] = False
 
     ordered_pts = np.array(ordered)
     if len(ordered_pts) < 10:

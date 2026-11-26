@@ -38,7 +38,7 @@ def preprocess_sar_logdb_clahe(img_gray, clahe=None, out_size=(384, 384)):
     if out_size is not None and (img_gray.shape[1], img_gray.shape[0]) != tuple(out_size):
         img_gray = cv2.resize(img_gray, out_size)
     log_g = np.log1p(img_gray.astype(np.float32))
-    lo, hi = np.percentile(log_g, [1.0, 99.5])
+    lo, hi = np.percentile(log_g[::4, ::4], [1.0, 99.5])
     if hi - lo > 1e-4:
         stretched = np.clip((log_g - lo) / (hi - lo), 0.0, 1.0)
     else:

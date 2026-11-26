@@ -19,10 +19,12 @@ import sys
 import json
 import zipfile
 import argparse
+from collections import OrderedDict
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import cv2
+cv2.setNumThreads(0)
 import torch
 from tqdm import tqdm
 
@@ -331,7 +333,26 @@ def build_zip_lookup(chunks_zip_path):
     return lookup
 
 
-def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop_size=512, chunk_size=800, stride=750):
+def _read_chunk_cached(zf, zip_lookup, prod, chunk_name, chunk_cache=None, max_cache=64):
+    """Decodes an 800x800 SAR chunk from zip with a bounded LRU cache to speed up 3x3 neighbor reads."""
+    key = (prod, chunk_name)
+    if chunk_cache is not None and key in chunk_cache:
+        chunk_cache.move_to_end(key)
+        return chunk_cache[key]
+    zname = zip_lookup.get(key)
+    if not zname:
+        return None
+    data = np.frombuffer(zf.read(zname), np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if img is not None and chunk_cache is not None:
+        chunk_cache[key] = img
+        chunk_cache.move_to_end(key)
+        if len(chunk_cache) > max_cache:
+            chunk_cache.popitem(last=False)
+    return img
+
+
+def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop_size=512, chunk_size=800, stride=750, chunk_cache=None):
     """
     Reads the target chunk and any needed 3x3 neighbor chunks directly from Dataset_S1_chunks.zip
     without unzipping the 10.5 GB archive. Uses MMDEC's true 750 px chunk stride (50 px overlap) and
@@ -345,11 +366,7 @@ def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop
 
     # Fast single-chunk path when crop stays strictly inside target chunk
     if half <= ship_x <= (chunk_size - half) and half <= ship_y <= (chunk_size - half):
-        zname = zip_lookup.get((prod, chunk_name))
-        if not zname:
-            return None
-        data = np.frombuffer(zf.read(zname), np.uint8)
-        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        img = _read_chunk_cached(zf, zip_lookup, prod, chunk_name, chunk_cache=chunk_cache)
         if img is None:
             return None
         ih, iw = img.shape[:2]
@@ -367,18 +384,15 @@ def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop
     ] + [(0, 0)]
 
     for di, dj in offsets:
-        zname = zip_lookup.get((prod, f"i{ci + di}j{cj + dj}"))
-        if zname:
-            data = np.frombuffer(zf.read(zname), np.uint8)
-            patch = cv2.imdecode(data, cv2.IMREAD_COLOR)
-            if patch is not None:
-                ph, pw = patch.shape[:2]
-                x0 = (di + 1) * stride
-                y0 = (dj + 1) * stride
-                h_use = min(ph, chunk_size, canvas_dim - y0)
-                w_use = min(pw, chunk_size, canvas_dim - x0)
-                if h_use > 0 and w_use > 0:
-                    canvas[y0:y0 + h_use, x0:x0 + w_use] = patch[:h_use, :w_use]
+        patch = _read_chunk_cached(zf, zip_lookup, prod, f"i{ci + di}j{cj + dj}", chunk_cache=chunk_cache)
+        if patch is not None:
+            ph, pw = patch.shape[:2]
+            x0 = (di + 1) * stride
+            y0 = (dj + 1) * stride
+            h_use = min(ph, chunk_size, canvas_dim - y0)
+            w_use = min(pw, chunk_size, canvas_dim - x0)
+            if h_use > 0 and w_use > 0:
+                canvas[y0:y0 + h_use, x0:x0 + w_use] = patch[:h_use, :w_use]
 
     cx = int(round(stride + ship_x))
     cy = int(round(stride + ship_y))
@@ -447,16 +461,17 @@ def run_mmdec_harvest_and_mask(
     else:
         straight_sel = straight_pool
 
-    selected_df = pd.concat([turning_sel, straight_sel], ignore_index=True).reset_index(drop=True)
+    selected_df = pd.concat([turning_sel, straight_sel], ignore_index=True).sort_values(["product_id", "chunk_name"]).reset_index(drop=True)
     print(f"[MMDEC SELECTED] Harvesting {len(selected_df):,} ships "
-          f"(Turning={len(turning_sel)}, Straight={len(straight_sel)})...")
+          f"(Turning={len(turning_sel)}, Straight={len(straight_sel)})...", flush=True)
 
-    # 2. Stream Crops Directly from Dataset_S1_chunks.zip
+    # 2. Stream Crops Directly from Dataset_S1_chunks.zip (with LRU chunk cache)
     corners_map = load_corners_index(MMDEC_DIR)
     zip_lookup = build_zip_lookup(chunks_zip_path)
-    print(f"[MMDEC ZIP INDEX] Indexed {len(zip_lookup):,} SAR chunks across {len(corners_map)} products.")
+    print(f"[MMDEC ZIP INDEX] Indexed {len(zip_lookup):,} SAR chunks across {len(corners_map)} products.", flush=True)
 
     cropped_rows = []
+    chunk_cache = OrderedDict()
     with zipfile.ZipFile(chunks_zip_path, "r") as zf:
         for idx, row in tqdm(selected_df.iterrows(), total=len(selected_df), desc="Cropping SAR chips from zip"):
             prod = row["product_id"]
@@ -476,7 +491,7 @@ def run_mmdec_harvest_and_mask(
             if not (-50 <= ship_x <= 850 and -50 <= ship_y <= 850):
                 continue
 
-            crop = extract_stitched_crop(zf, zip_lookup, prod, chunk, ship_x, ship_y, crop_size=512, chunk_size=800, stride=750)
+            crop = extract_stitched_crop(zf, zip_lookup, prod, chunk, ship_x, ship_y, crop_size=512, chunk_size=800, stride=750, chunk_cache=chunk_cache)
             if crop is None:
                 continue
 

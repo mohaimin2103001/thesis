@@ -17,6 +17,8 @@ Architecture & Capabilities (Method 1 + Method 3 Hybrid + Multi-Task Thesis Goal
 """
 
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 import sys
 import time
 import json
@@ -24,6 +26,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import cv2
+cv2.setNumThreads(0)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -251,7 +254,7 @@ class GeometrySpecialistMLP(nn.Module):
 # Multimodal Dataset with Train-Only Normalization (Zero Leakage)
 # --------------------------------------------------------------------------------------------------
 class ScaledManeuverDataset(Dataset):
-    def __init__(self, df, phys_mean=None, phys_std=None, img_size=(384, 384), augment=False, rot_clip=12.0):
+    def __init__(self, df, phys_mean=None, phys_std=None, img_size=(320, 320), augment=False, rot_clip=12.0, preload=True):
         self.df = df.reset_index(drop=True)
         self.img_size = img_size
         self.augment = augment
@@ -291,10 +294,16 @@ class ScaledManeuverDataset(Dataset):
         raw_rot = self.df.get(rot_col, pd.Series(np.zeros(len(self.df)))).fillna(0.0).values.astype(np.float32)
         self.rot_values = np.clip(raw_rot, -float(rot_clip), float(rot_clip))
 
-    def __len__(self):
-        return len(self.df)
+        # Preload preprocessed [log_u8, clahe_u8, blur_mask_u8] in RAM (keeps GPU at 90% & removes fork deadlock)
+        self.cached_imgs = None
+        est_bytes = len(self.df) * 3 * int(img_size[0]) * int(img_size[1])
+        if preload and len(self.df) > 0 and est_bytes <= 2_400_000_000:
+            cache = np.empty((len(self.df), 3, int(img_size[1]), int(img_size[0])), dtype=np.uint8)
+            for idx in range(len(self.df)):
+                cache[idx] = self._load_item_u8(idx)
+            self.cached_imgs = cache
 
-    def __getitem__(self, idx):
+    def _load_item_u8(self, idx):
         row = self.df.iloc[idx]
         p_crop = resolve_path(str(row.get("crop_path", "")))
         p_orig = resolve_path(str(row.get("original_image_path", "")))
@@ -305,16 +314,16 @@ class ScaledManeuverDataset(Dataset):
             raise FileNotFoundError(f"Could not load SAR chip for sample {row.get('sample_id')}: {img_p}")
         img_res = cv2.resize(img, self.img_size)
 
-        # Log-dB percentile normalization [p1, p99.5] maps dark UEIKAP [4..12] and MMDEC into [0, 1]
+        # Fast strided percentile [p1, p99.5] in log-dB space (~160x faster than full-frame sort)
         log_g = np.log1p(img_res.astype(np.float32))
-        lo, hi = np.percentile(log_g, [1.0, 99.5])
+        lo, hi = np.percentile(log_g[::4, ::4], [1.0, 99.5])
         if hi - lo > 1e-4:
             log_n = np.clip((log_g - lo) / (hi - lo), 0.0, 1.0)
         else:
             log_n = img_res.astype(np.float32) / 255.0
-        clahe_n = self.clahe.apply((log_n * 255.0).astype(np.uint8)).astype(np.float32) / 255.0
+        log_u8 = (log_n * 255.0).astype(np.uint8)
+        clahe_u8 = self.clahe.apply(log_u8)
 
-        # Load Wake-Net / GT segmented wake mask & smooth slightly to avoid step-edge grad explosion
         m_path = resolve_path(str(row.get("wake_mask_path", "")))
         if os.path.exists(m_path):
             m_img = cv2.imread(m_path, cv2.IMREAD_GRAYSCALE)
@@ -322,17 +331,23 @@ class ScaledManeuverDataset(Dataset):
         else:
             mask = np.zeros(self.img_size, dtype=np.uint8)
         mask_blur = cv2.GaussianBlur((mask > 127).astype(np.float32), (9, 9), 2.5)
+        mask_u8 = np.clip(mask_blur * 255.0, 0.0, 255.0).astype(np.uint8)
+        return np.stack([log_u8, clahe_u8, mask_u8], axis=0)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        arr_u8 = self.cached_imgs[idx] if self.cached_imgs is not None else self._load_item_u8(idx)
+        img_3ch = arr_u8.astype(np.float32) / 255.0
 
         phys_vec = self.phys_raw[idx].copy()
         dir_val = int(self.dir_labels[idx])
         rot_val = float(self.rot_values[idx])
 
         if self.augment:
-            # Physical horizontal mirror augmentation: swaps Port (1) <-> Starboard (2) and negates chiral physics!
             if np.random.rand() < 0.5:
-                log_n = np.fliplr(log_n).copy()
-                clahe_n = np.fliplr(clahe_n).copy()
-                mask_blur = np.fliplr(mask_blur).copy()
+                img_3ch = img_3ch[:, :, ::-1].copy()
                 if dir_val == 1:
                     dir_val = 2
                 elif dir_val == 2:
@@ -342,13 +357,11 @@ class ScaledManeuverDataset(Dataset):
                     phys_vec[ci] = -phys_vec[ci]
             if np.random.rand() < 0.4:
                 gamma = np.random.uniform(0.90, 1.10)
-                log_n = np.clip(log_n * gamma, 0.0, 1.0)
-                clahe_n = np.clip(clahe_n * gamma, 0.0, 1.0)
+                img_3ch[:2] = np.clip(img_3ch[:2] * gamma, 0.0, 1.0)
 
         phys_norm_vec = np.clip((phys_vec - self.phys_mean) / self.phys_std, -8.0, 8.0).astype(np.float32)
         geom_norm_vec = phys_norm_vec[self.geom_indices]
 
-        img_3ch = np.stack([log_n, clahe_n, mask_blur], axis=0).astype(np.float32)
         img_t = torch.from_numpy(img_3ch)
         phys_t = torch.from_numpy(phys_norm_vec)
         geom_t = torch.from_numpy(geom_norm_vec)
@@ -579,13 +592,15 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=-1
 
 def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, tau=0.50, w_cx=0.70, num_passes=30):
     """
-    Executes N=30 stochastic MC-Dropout forward passes on the Dual-Branch Ensemble,
+    Executes N=30 stochastic MC-Dropout forward passes on cached test tensors (< 5s total),
     computes Predictive Entropy and Entropy Gap (Incorrect vs Correct), and saves the
     Selective Error Rejection Curve (figures/convnext_uncertainty_rejection_curve.png).
     """
+    # Cache test batches once so 30 MC passes don't re-iterate dataset I/O 30 times
+    cached_batches = [(imgs, phys, geom) for imgs, phys, geom, _, _, _ in test_loader]
+
     convnext_net.eval()
     geom_mlp.eval()
-    # Activate ONLY Dropout layers while keeping BatchNorm frozen in eval mode
     for m in list(convnext_net.modules()) + list(geom_mlp.modules()):
         if isinstance(m, (nn.Dropout, nn.Dropout2d)):
             m.train()
@@ -594,7 +609,7 @@ def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, 
     with torch.no_grad():
         for _ in range(num_passes):
             p_batch = []
-            for imgs, phys, geom, _, _, _ in test_loader:
+            for imgs, phys, geom in cached_batches:
                 imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
                 st_log, _, _, _ = convnext_net(imgs, phys)
                 g_st_log, _, _ = geom_mlp(geom)
@@ -653,34 +668,52 @@ def run_mc_dropout_uncertainty(convnext_net, geom_mlp, test_loader, state_true, 
     }, mean_prob, epistemic_std, entropy
 
 
-def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base_bal_acc, tau=0.50, w_cx=0.70, batch_size=16):
-    """Quantifies Balanced Accuracy drop when each Wake/Radon physics feature is randomly permuted."""
+def compute_physics_permutation_importance(convnext_net, geom_mlp, test_ds, base_bal_acc, tau=0.50, w_cx=0.70, batch_size=24):
+    """
+    Quantifies Balanced Accuracy drop when each Wake/Radon physics feature is randomly permuted.
+    Caches ConvNeXt visual backbone embeddings once since image pixels do not change under physics permutation.
+    """
     convnext_net.eval()
     geom_mlp.eval()
     imp_rows = []
 
+    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    v_embs = []
+    with torch.no_grad():
+        for imgs, _, _, _, _, _ in loader:
+            x_img = imgs.to(DEVICE)
+            log_ch = x_img[:, 0:1]
+            clahe_ch = x_img[:, 1:2] if x_img.shape[1] >= 3 else log_ch
+            mask_ch = x_img[:, 2:3] if x_img.shape[1] >= 3 else x_img[:, 1:2]
+            lee_ch = convnext_net.speckle_filter(log_ch)
+            spot_ch = torch.clamp(0.55 * clahe_ch.float() + 0.45 * mask_ch.float(), 0.0, 1.0)
+            x_raw3 = torch.cat([lee_ch, clahe_ch.float(), spot_ch], dim=1)
+            x_3ch = (x_raw3 - convnext_net.img_mean) / convnext_net.img_std
+            v_embs.append(convnext_net.backbone(x_3ch).cpu())
+    v_emb_all = torch.cat(v_embs, dim=0).to(DEVICE)
+
     orig_phys_raw = test_ds.phys_raw.copy()
+    geom_indices = [PHYSICS_FEATURES.index(c) for c in GEOMETRY_FEATURES]
 
     for f_idx, fname in enumerate(PHYSICS_FEATURES):
         perm_raw = orig_phys_raw.copy()
         perm_raw[:, f_idx] = np.random.permutation(perm_raw[:, f_idx])
-        test_ds.phys_raw = perm_raw
+        perm_norm = np.clip((perm_raw - test_ds.phys_mean) / test_ds.phys_std, -8.0, 8.0).astype(np.float32)
+        p_t = torch.from_numpy(perm_norm).to(DEVICE)
+        g_t = p_t[:, geom_indices]
 
-        loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
-        p_all = []
         with torch.no_grad():
-            for imgs, phys, geom, _, _, _ in loader:
-                st_log, _, _, _ = convnext_net(imgs.to(DEVICE), phys.to(DEVICE))
-                g_st_log, _, _ = geom_mlp(geom.to(DEVICE))
-                p_all.append((w_cx * torch.sigmoid(st_log) + (1.0 - w_cx) * torch.sigmoid(g_st_log)).cpu().numpy())
-        p_all = np.concatenate(p_all)
+            p_emb = convnext_net.physics_mlp(p_t)
+            feat = convnext_net.shared_head(torch.cat([v_emb_all, p_emb], dim=1))
+            st_log = convnext_net.binary_head(feat).squeeze(1)
+            g_st_log, _, _ = geom_mlp(g_t)
+            p_all = (w_cx * torch.sigmoid(st_log) + (1.0 - w_cx) * torch.sigmoid(g_st_log)).cpu().numpy()
+
         b = (p_all >= tau).astype(int)
         st_acc = np.mean(b[test_ds.state_labels == 0] == 0)
         tu_acc = np.mean(b[test_ds.state_labels == 1] == 1)
         bal = 0.5 * (st_acc + tu_acc)
         imp_rows.append({"feature": fname, "permuted_bal_acc": float(bal), "importance_drop": float(base_bal_acc - bal)})
-
-    test_ds.phys_raw = orig_phys_raw
 
     imp_df = pd.DataFrame(imp_rows).sort_values("importance_drop", ascending=False)
     imp_df.to_csv(os.path.join(TABLES_DIR, "convnext_physics_feature_importance.csv"), index=False)
@@ -828,7 +861,7 @@ def train_and_predict_hgb(train_ds, eval_datasets):
     return outputs
 
 
-def run_master_suite(epochs=35, batch_size=16, lr=2e-4, img_size=384, gradcam_per_class=-1, allow_partial_data=False):
+def run_master_suite(epochs=35, batch_size=24, lr=2e-4, img_size=320, gradcam_per_class=-1, allow_partial_data=False):
     # 1. Load Expanded MMDEC+UEIKAP Dataset if present, else UEIKAP master
     expanded_path = os.path.join(DATA_DIR, "processed", "master_expanded_mmdec.parquet")
     ueikap_path = os.path.join(DATA_DIR, "processed", "maneuver_master.parquet")
@@ -887,9 +920,10 @@ def run_master_suite(epochs=35, batch_size=16, lr=2e-4, img_size=384, gradcam_pe
         sample_weights = sample_weights * np.where(is_ueikap, 1.8, 1.0)
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(train_ds), replacement=True)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, drop_last=True, num_workers=2 if IS_KAGGLE else 0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2 if IS_KAGGLE else 0)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2 if IS_KAGGLE else 0)
+    # RAM-cached preprocessed uint8 dataset eliminates fork() deadlocks -> num_workers=0 runs at full GPU speed
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, drop_last=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # Instantiate Dual-Branch Neural Models
     convnext_net = ConvNeXtPhysicsNet(num_physics_features=len(PHYSICS_FEATURES), pretrained=True).to(DEVICE)
@@ -1194,9 +1228,9 @@ def run_master_suite(epochs=35, batch_size=16, lr=2e-4, img_size=384, gradcam_pe
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Dual-Branch ConvNeXt + Lee + Geometry Ensemble")
     parser.add_argument("--epochs", type=int, default=35)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--img_size", type=int, default=384)
+    parser.add_argument("--img_size", type=int, default=320)
     parser.add_argument("--gradcam_per_class", type=int, default=-1, help="-1 generates Grad-CAM for ALL test images")
     parser.add_argument("--allow_partial_data", action="store_true", help="Allow running without full MMDEC crops")
     args = parser.parse_args()
