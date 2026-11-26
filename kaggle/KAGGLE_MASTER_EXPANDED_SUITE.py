@@ -240,8 +240,7 @@ class ScaledManeuverDataset(Dataset):
             self.dir_labels = np.where(np.abs(rot_vals) < 0.5, 0, np.where(rot_vals < 0, 1, 2))
 
         rot_col = "rot_target" if "rot_target" in self.df.columns else ("rot_deg_min" if "rot_deg_min" in self.df.columns else "rot")
-        raw_rot_vals = self.df.get(rot_col, pd.Series(np.zeros(len(self.df)))).fillna(0.0).values.astype(np.float32)
-        self.rot_values = np.clip(raw_rot_vals, -12.0, 12.0)
+        self.rot_values = self.df.get(rot_col, pd.Series(np.zeros(len(self.df)))).fillna(0.0).values.astype(np.float32)
 
     def __len__(self):
         return len(self.df)
@@ -303,7 +302,7 @@ class ScaledManeuverDataset(Dataset):
 # Physics-Informed Multi-Task Loss
 # --------------------------------------------------------------------------------------------------
 class PhysicsInformedMultiTaskLoss(nn.Module):
-    def __init__(self, pos_weight=2.0, dir_weights=None, lambda_dir=0.40, lambda_rot=0.08, lambda_phys=0.05):
+    def __init__(self, pos_weight=2.0, dir_weights=None, lambda_dir=0.45, lambda_rot=0.45, lambda_phys=0.05):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=DEVICE))
         if dir_weights is not None:
@@ -317,8 +316,10 @@ class PhysicsInformedMultiTaskLoss(nn.Module):
     def forward(self, state_logit, dir_logits, rot_pred, state_t, dir_t, rot_t, signed_curv):
         l_state = self.bce(state_logit, state_t)
         l_dir = self.ce_dir(dir_logits, dir_t)
-        rot_weights = 1.0 + 1.0 * state_t
+        # Weight turning vessels 3x in signed ROT regression so turning magnitude is learned cleanly
+        rot_weights = 1.0 + 3.0 * state_t
         l_rot = torch.mean(rot_weights * F.smooth_l1_loss(rot_pred, rot_t, reduction="none", beta=1.0))
+        # Light sign-coherence constraint on turning vessels
         l_phys = torch.mean(state_t * torch.relu(-rot_pred * torch.sign(rot_t)))
         return l_state + self.lambda_dir * l_dir + self.lambda_rot * l_rot + self.lambda_phys * l_phys
 
@@ -457,7 +458,7 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=-1
             ax.axis("off")
         plt.tight_layout()
         sid_safe = str(row.get("sample_id", f"idx_{idx}")).replace("/", "_").replace("\\", "_")
-        plt.savefig(os.path.join(out_dir, f"convnext_gradcam_{k+1:04d}_{sid_safe}.png"), dpi=90)
+        plt.savefig(os.path.join(out_dir, f"convnext_gradcam_{k+1:04d}_{sid_safe}.png"), dpi=110)
         plt.close(fig)
 
         audit_rows.append({
@@ -641,11 +642,14 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
         features=np.array(PHYSICS_FEATURES)
     )
 
-    # Sampler already yields ~50% Straight, ~25% Port, ~25% Starboard per batch -> use gentle [0.8, 1.3, 1.3]
+    # Class balancing sampler + dynamic loss weights
     n_st = max(1, int(np.sum(train_ds.state_labels == 0)))
     n_tu = max(1, int(np.sum(train_ds.state_labels == 1)))
     pos_weight = float(np.clip(n_st / n_tu, 1.0, 4.0))
-    dir_weights = np.array([0.8, 1.3, 1.3], dtype=np.float32)
+
+    dir_counts = np.bincount(train_ds.dir_labels, minlength=3).astype(np.float32) + 1.0
+    dir_weights = (dir_counts.sum() / (3.0 * dir_counts))
+    dir_weights = np.clip(dir_weights, 0.5, 5.0)
 
     sample_weights = np.where(train_ds.state_labels == 1, pos_weight, 1.0)
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(train_ds), replacement=True)
@@ -654,7 +658,7 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
 
-    # Instantiate Dual-Branch Ensemble Models with INDEPENDENT optimizers & schedulers
+    # Instantiate Dual-Branch Ensemble Models
     convnext_net = ConvNeXtPhysicsNet(num_physics_features=len(PHYSICS_FEATURES), pretrained=True).to(DEVICE)
     geom_mlp = GeometrySpecialistMLP(in_features=len(GEOMETRY_FEATURES)).to(DEVICE)
 
@@ -662,19 +666,17 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
     bce_geom = nn.BCEWithLogitsLoss()
     ce_geom_dir = nn.CrossEntropyLoss(weight=torch.tensor(dir_weights, dtype=torch.float32, device=DEVICE))
 
-    opt_cx = torch.optim.AdamW([
+    optimizer = torch.optim.AdamW([
         {"params": convnext_net.backbone.parameters(), "lr": lr * 0.5},
-        {"params": convnext_net.physics_mlp.parameters(), "lr": lr * 1.5},
-        {"params": convnext_net.shared_head.parameters(), "lr": lr * 1.5},
-        {"params": convnext_net.binary_head.parameters(), "lr": lr * 1.5},
-        {"params": convnext_net.direction_head.parameters(), "lr": lr * 1.5},
-        {"params": convnext_net.rot_head.parameters(), "lr": lr * 1.5},
+        {"params": convnext_net.physics_mlp.parameters(), "lr": lr},
+        {"params": convnext_net.shared_head.parameters(), "lr": lr},
+        {"params": convnext_net.binary_head.parameters(), "lr": lr},
+        {"params": convnext_net.direction_head.parameters(), "lr": lr},
+        {"params": convnext_net.rot_head.parameters(), "lr": lr},
+        {"params": geom_mlp.parameters(), "lr": lr * 2.0},
     ], weight_decay=1e-4)
-    opt_geom = torch.optim.AdamW(geom_mlp.parameters(), lr=1e-3, weight_decay=1e-4)
-
-    sched_cx = torch.optim.lr_scheduler.CosineAnnealingLR(opt_cx, T_max=epochs, eta_min=1e-6)
-    sched_geom = torch.optim.lr_scheduler.CosineAnnealingLR(opt_geom, T_max=epochs, eta_min=1e-5)
-    scaler_cx = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
 
     best_cx_score = -1.0
     best_geom_score = -1.0
@@ -689,29 +691,22 @@ def run_master_suite(epochs=25, batch_size=32, lr=2e-4, gradcam_per_class=-1):
             imgs, phys, geom = imgs.to(DEVICE), phys.to(DEVICE), geom.to(DEVICE)
             state_t, dir_t, rot_t = state_t.to(DEVICE), dir_t.to(DEVICE), rot_t.to(DEVICE)
 
-            # 1. Train ConvNeXt Branch A independently
-            opt_cx.zero_grad()
+            optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=(DEVICE.type == "cuda")):
                 st_log, dir_log, rot_out = convnext_net(imgs, phys)
+                g_st_log, g_dir_log = geom_mlp(geom)
+
                 loss_cx = criterion(st_log, dir_log, rot_out, state_t, dir_t, rot_t, phys[:, 5])
-            scaler_cx.scale(loss_cx).backward()
-            scaler_cx.unscale_(opt_cx)
-            torch.nn.utils.clip_grad_norm_(convnext_net.parameters(), max_norm=2.0)
-            scaler_cx.step(opt_cx)
-            scaler_cx.update()
+                loss_g = bce_geom(g_st_log, state_t) + 0.4 * ce_geom_dir(g_dir_log, dir_t)
+                loss = loss_cx + 0.5 * loss_g
 
-            # 2. Train Geometry Specialist Branch B independently (zero interference!)
-            opt_geom.zero_grad()
-            g_st_log, g_dir_log = geom_mlp(geom)
-            loss_g = bce_geom(g_st_log, state_t) + 0.4 * ce_geom_dir(g_dir_log, dir_t)
-            loss_g.backward()
-            torch.nn.utils.clip_grad_norm_(geom_mlp.parameters(), max_norm=2.0)
-            opt_geom.step()
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(list(convnext_net.parameters()) + list(geom_mlp.parameters()), max_norm=2.0)
+            scaler.step(optimizer)
+            scaler.update()
+            running_loss += loss.item() * len(state_t)
 
-            running_loss += loss_cx.item() * len(state_t)
-
-        sched_cx.step()
-        sched_geom.step()
+        scheduler.step()
         train_loss = running_loss / max(1, len(train_loader.dataset))
 
         # Independent Validation Check for ConvNeXt Branch A & Geometry MLP Branch B
