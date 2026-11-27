@@ -11,7 +11,8 @@
 > **Benchmark:** Official UEIKAP Maritime Telemetry Benchmark ([Zenodo DOI: 10.5281/zenodo.18391027](https://doi.org/10.5281/zenodo.18391027))
 
 📖 **Documentation & Full Report:**  
-* 📄 **Complete 17-Section Defense Report & Mathematical Physics:** 👉 **[FULL_THESIS_PROJECT_REPORT.md](FULL_THESIS_PROJECT_REPORT.md)**  
+* 📚 **Complete Beginning-to-End Chronicle (Zero-Skip Documentation):** 👉 **[COMPLETE_PROJECT_CHRONICLE_AND_DOCUMENTATION.md](COMPLETE_PROJECT_CHRONICLE_AND_DOCUMENTATION.md)**  
+* 📄 **Complete Defense Report & Mathematical Physics:** 👉 **[FULL_THESIS_PROJECT_REPORT.md](FULL_THESIS_PROJECT_REPORT.md)**  
 * 🚀 **Zero-to-Hero Replication Manual (Any PC / OS Setup):** 👉 **[REPRODUCTION_GUIDE.md](REPRODUCTION_GUIDE.md)**  
 * 🎓 **Viva-Voce Examination Guide & Model Answers:** 👉 **[thesis_defense_guide.md](thesis_defense_guide.md)**  
 
@@ -19,12 +20,15 @@
 
 ## 1. Executive Summary & Research Impact
 
+> **Latest Clean Benchmark (`4,108` Pure Trajectory-Verified Vessels):** See **[COMPLETE_PROJECT_CHRONICLE_AND_DOCUMENTATION.md](COMPLETE_PROJECT_CHRONICLE_AND_DOCUMENTATION.md)** and **[FULL_THESIS_PROJECT_REPORT.md](FULL_THESIS_PROJECT_REPORT.md)** (Section 17.8) for full end-to-end coverage: **`ROC-AUC = 0.8165`** (`MMDEC: 0.8334`, tactical turns $|ROT| \ge 2^\circ/\text{min}: 0.8572`), **`PR-AUC = 0.6937`**, **`Straight 76.10% / Turning 72.39%` (`tau=0.52`)**, **`Overfit Gap = -0.0072 / +0.0259`**, and **`MC-Dropout` `40–50%` triage `AUC = 0.8918–0.9001` (`84.85%–86.92%` overall accuracy)**.
+
 In maritime domain awareness, non-compliant or illicit vessels (e.g., illegal fishing, sanction-evading oil tankers, smugglers) deliberately switch off or spoof Automatic Identification System (AIS) radio transponders ("going dark"). Spaceborne radar provides un-spoofable, all-weather, day-and-night coverage. However, satellite SAR suffers from severe dynamic range compression due to specular microwave reflection over water (over 99% of raw ocean pixels are $\le 5$ DN). 
 
-By developing a specialized radar preprocessing pipeline (Percentile Contrast Stretch + CLAHE), integrating Monte Carlo Dropout epistemic uncertainty, verifying hydrodynamic feature learning via Grad-CAM, and demonstrating robustness under simulated sea states, this research achieves defense-grade performance:
-* **Baseline Raw SAR Model:** 55.32% Accuracy (random guessing due to dynamic range suppression)
-* **CLAHE-Enhanced ResNet-18:** **73.40% Accuracy** (+18.08% absolute gain), Macro F1 = 0.5612
-* **Dual-Architecture Ensemble (+ 4-Fold TTA):** **77.66% Accuracy**, Macro F1 = 0.6141, Specificity = 84.8%
+By developing a specialized radar preprocessing pipeline (Percentile Contrast Stretch + CLAHE), integrating Monte Carlo Dropout epistemic uncertainty, verifying hydrodynamic feature learning via Grad-CAM, and demonstrating robustness under simulated sea states, this research progressed from the initial UEIKAP baseline to the full multi-dataset ensemble:
+* **Initial Baseline Raw SAR Model (`UEIKAP`, `n=94` test):** 55.32% Accuracy (random guessing due to dynamic range suppression)
+* **Initial CLAHE-Enhanced ResNet-18:** **73.40% Accuracy** (+18.08% absolute gain), Macro F1 = 0.5612
+* **Initial Dual-Architecture Ensemble (+ 4-Fold TTA):** **77.66% Accuracy**, Macro F1 = 0.6141, Specificity = 84.8%
+* **Final Scaled Dual-Scale `ConvNeXt-Tiny + SwinV2-Tiny` (`4,108` Clean Ships, `n=594` test):** **`0.8165 ROC-AUC` (`0.8334 MMDEC`), `72.39%` Turning Recall, Zero Overfitting (`-0.0072` / `+0.0259` gap)**
 
 ---
 
