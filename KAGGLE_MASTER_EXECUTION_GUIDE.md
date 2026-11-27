@@ -27,7 +27,7 @@ print("=" * 80)
 print("=== 1. CLONING MASTER THESIS REPOSITORY ===")
 print("=" * 80)
 if os.path.exists('/kaggle/working/thesis/.git'):
-    !git -C /kaggle/working/thesis fetch origin && !git -C /kaggle/working/thesis reset --hard origin/main
+    !git -C /kaggle/working/thesis fetch origin && git -C /kaggle/working/thesis reset --hard origin/main
 else:
     !git clone https://github.com/mohaimin2103001/thesis.git /kaggle/working/thesis
 %cd /kaggle/working/thesis
