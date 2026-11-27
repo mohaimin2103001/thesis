@@ -66,15 +66,15 @@ else:
     print("Using existing checkpoints/wake_net/wake_net_3ch_best.pt already trained!")
 
 print("\n" + "=" * 80)
-print("=== 5. STAGE 2: MMDEC HARVESTER + PSEUDO-LABEL WAKE-NET ADAPT + PCA BEND ===")
+print("=== 5. STAGE 2: MMDEC CAUSAL-AIS HARVESTER + WAKE-NET ADAPT + 640px FOV ===")
 print("=" * 80)
 # Set --max_straight -1 if you want EVERY single straight ship in MMDEC
-run_stage(["python", "-u", "-m", "src.data.mmdec_extract_and_mask", "--min_sog", "3.5", "--min_turn_rot", "1.5", "--max_straight", "4000", "--max_turning", "-1", "--batch_size", "32"])
+run_stage(["python", "-u", "-m", "src.data.mmdec_extract_and_mask", "--min_sog", "3.5", "--min_turn_rot", "1.25", "--max_straight", "4000", "--max_turning", "-1", "--crop_size", "640", "--batch_size", "32"])
 
 print("\n" + "=" * 80)
-print("=== 6. STAGE 3: TRAINING DUAL-SCALE WAKE-ALIGNED CONVNEXT + SWINV2 + PCA-HGB ENSEMBLE ===")
+print("=== 6. STAGE 3: TRAINING STERN-ALIGNED ANTI-OVERFIT CONVNEXT-SMALL + SWINV2 + RESNET50D ===")
 print("=" * 80)
-run_stage(["python", "-u", "kaggle/KAGGLE_MASTER_EXPANDED_SUITE.py", "--epochs", "20", "--batch_size", "24", "--lr", "2e-4", "--img_size", "256", "--second_backbone", "swinv2_tiny_window8_256", "--gradcam_per_class", "-1"])
+run_stage(["python", "-u", "kaggle/KAGGLE_MASTER_EXPANDED_SUITE.py", "--epochs", "18", "--batch_size", "24", "--lr", "2e-4", "--img_size", "256", "--primary_backbone", "convnext_small", "--second_backbone", "swinv2_tiny_window8_256", "--third_backbone", "resnet50d", "--gradcam_per_class", "-1"])
 
 print("\n" + "=" * 80)
 print("=== 7. PACKAGING WEIGHTS, METRICS & GRAD-CAM VISUALS ===")

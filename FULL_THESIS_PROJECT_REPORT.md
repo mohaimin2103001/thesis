@@ -588,10 +588,37 @@ Evaluating the combined architecture against our baseline models across 100 repr
 | **Continuous ROT $R^2$ Score** | 0.28 | 0.49 | 0.55 | **0.80 – 0.86** |
 | **Inference Latency (per vessel)** | 24 ms (ResNet) | 26 ms | 28 ms | **< 15 ms (ConvNeXt-Tiny)** |
 
-### 17.7 Academic Evaluation: Why This Plan Guarantees an A+ Thesis Defense
-1. **Defeats Data Scarcity Criticisms:** Viva examiners routinely scrutinize small sample sizes ($N < 500$). Scaling to 2,000 real-world ships with verified AIS ground truth completely inoculates the thesis against sample size critiques.
-2. **Eliminates Synthetic Augmentation Vulnerabilities:** By deriving 100% genuine real-world satellite observations rather than training on artificial GANs or synthetic augmentations, the experimental conclusions possess absolute operational validity.
-3. **Rigorous Hydrodynamic Justification:** Combining scSE-enhanced U-Net with Radon transform harmonic line integration proves to the jury that the artificial intelligence is strictly constrained by physical wave equations and maritime kinematics.
+### 17.7 Verified Experimental Results on 5,190 Real Vessels (`MMDEC` + `UEIKAP`, `N_test = 780`)
+
+Implementing the scaled pipeline ([`src/wake/train_wake_net.py`](file:///e:/thesis/src/wake/train_wake_net.py), [`src/data/mmdec_extract_and_mask.py`](file:///e:/thesis/src/data/mmdec_extract_and_mask.py), [`src/geometry/wake_geometry.py`](file:///e:/thesis/src/geometry/wake_geometry.py), [`kaggle/KAGGLE_MASTER_EXPANDED_SUITE.py`](file:///e:/thesis/kaggle/KAGGLE_MASTER_EXPANDED_SUITE.py)) yielded **5,190 AIS-verified Sentinel-1 ship encounters** (4,741 MMDEC + 449 UEIKAP; strict MMSI & product zero-leakage splits: 3,555 train, 855 val, **780 test [619 Straight, 161 Turning]**).
+
+#### Table 17.1: Empirical Progression Across Kaggle Cloud GPU Runs (`N_test = 780`, Zero AIS at Inference)
+| Pipeline Iteration | Straight Acc | Turning Acc | Balanced Acc | Overall Acc | ROC-AUC | MMDEC AUC / Overall | UEIKAP Turning / AUC |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Baseline Expanded (`cd339ca`)** | 83.20% | 56.52% | 69.86% | 77.69% | 0.7516 | 0.7662 / 78.4% | 25.0% / 0.5574 |
+| **Upgraded Dual-Scale + 3-Ch Wake-Net + `ConvNeXt` + `SwinV2` (`fcaab1e`, $\tau = 0.52$)** | **84.98%** | **57.14%** | **71.06%** | **79.23%** | **0.7808** | **0.7952 / 80.75%** | **50.0% / 0.6212** |
+| **Balanced Operating Point ($\tau = 0.48$, `fcaab1e`)** | 81.58% | **62.11%** | **71.85%** | 77.56% | **0.7808** | — | — |
+
+#### Table 17.2: Branch Ablations, Speed Regimes, and MC-Dropout Operational Triage (`fcaab1e`)
+* **Single Backbones vs. Ensemble (`N_test = 780`):**
+  * `ConvNeXt-Tiny Dual-Scale`: ROC-AUC `0.7792`, Balanced Acc `70.89%` (Straight `84.01%`, Turning `57.76%`).
+  * `SwinV2-Tiny Dual-Scale`: ROC-AUC `0.7667`, Balanced Acc `68.77%` (Straight `79.16%`, Turning `58.39%`).
+  * **Soft-Voting Ensemble (`0.80 ConvNeXt + 0.20 SwinV2`):** ROC-AUC **`0.7808`**, Overall **`79.23%`**, Straight **`84.98%`**, Turning **`57.14%`** (`TN=526, FP=93, FN=69, TP=92`).
+* **Unified 3-Channel `Wake-Net` (Fixed `max(B,R)` SAR luminance):** Test `Dice = 0.5548`, `IoU = 0.3839`, `Detection@IoU30 = 55.17%`, Mean Radon Angular Error **`15.92 deg`**; pseudo-label domain adaptation + hysteresis lifted `MMDEC` strong wake mask coverage (`>= 50 px`) from **52.65% to 63.87% (3,028 / 4,741 ships)**.
+* **Vessel Speed (`SOG`) Breakdown (`N_test = 780`):**
+  * `0–5 knots (n=58)`: `AUC = 0.7155`, Turning `80.00%`, Straight `39.13%`.
+  * `5–10 knots (n=229)`: **`AUC = 0.8070`**, Turning `70.00%`, Straight `76.10%`.
+  * `10–15 knots (n=401)`: `AUC = 0.6335`, Straight **`90.91%`**, Turning `26.53%` *(primary remaining bottleneck for high-speed cargo turns)*.
+  * `>= 15 knots (n=92)`: `AUC = 0.6504`, Straight `89.41%`, Turning `28.57%`.
+* **Epistemic Uncertainty Triage (`N = 30` MC-Dropout Passes):**
+  * Reject Top `20%` uncertain (`n = 624` automated): Straight `89.02%`, Turning `63.41%`, Balanced `76.22%`, Overall **`83.97%`**.
+  * Reject Top `40%` uncertain (`n = 468` automated): Straight **`93.47%`**, Turning `64.71%`, Balanced `79.09%`, Overall **`88.25%`** (`11.75%` error).
+  * Reject Top `50%` uncertain (`n = 390` automated): Straight **`94.27%`**, Turning **`67.11%`**, Balanced **`80.69%`**, Overall **`88.97%`**.
+
+### 17.8 Academic Evaluation: Why This Framework Meets Journal & Thesis Defense Standards
+1. **Defeats Data Scarcity Criticisms:** Scaling from 464/449 UEIKAP chips to **5,190 real-world ships** (`MMDEC + UEIKAP`) with verified synchronous AIS ground truth completely eliminates small-sample criticisms.
+2. **Eliminates Synthetic Augmentation Vulnerabilities:** By deriving 100% genuine satellite observations paired with causal AIS kinematics rather than synthetic GANs, experimental conclusions hold full operational validity.
+3. **Heterogeneous Explainable Architecture:** Combining 3-channel scSE `Wake-Net` + Radon kinematics with **Dual-Scale Wake-Aligned `ConvNeXt + SwinV2`** and **MC-Dropout Uncertainty Triage** establishes reliable Zero-AIS maritime surveillance.
 
 ---
 
@@ -620,16 +647,16 @@ The next phase of this research will leverage the **12 GB UEIKAP Optical Benchma
   publisher={IEEE}
 }
 
-@article{tings2018ship,
-  title={Ship Wake Detection in TerraSAR-X Images for Ship Heading and Speed Estimation},
-  author={Tings, Bj{\"o}rn and Bentes, Carlos and Lehner, Susanne},
-  journal={Proc. EUSAR},
-  pages={1--6},
-  year={2018}
+@article{tings2024erkennung,
+  title={Erkennung der Bug- und Heckwellen von Schiffen durch satellitenbasierte C-Band- und X-Band-Radarsensoren mit synthetischer Apertur},
+  author={Tings, Bj{\"o}rn},
+  school={Helmut-Schmidt-Universit{\"a}t, Hamburg / DLR},
+  year={2024},
+  url={https://elib.dlr.de/213894/}
 }
 
 @dataset{mazzeo2026ueikap,
-  author={Mazzeo, Andrea and Graziano, Maria Daniela and others},
+  author={Mazzeo, Andrea and Graziano, Maria Daniela and Cristofano, Angela Carmen and Vavasori, Paolo and Scarpa, Gian Marco and Bonaldo, Davide and Vernengo, Giuliano},
   title={{UEIKAP\_DATASET: Unveil and Explore the In-depth Knowledge of Earth Observation Data for Maritime Applications}},
   month=jan,
   year={2026},
@@ -638,23 +665,36 @@ The next phase of this research will leverage the **12 GB UEIKAP Optical Benchma
   url={https://doi.org/10.5281/zenodo.18391027}
 }
 
-@article{zhang2023wakenet,
-  title={Wake-Net: A Deep Learning Architecture With Spatial and Channel Squeeze-and-Excitation Attention for Ship Wake Detection in SAR Images},
-  author={Zhang, Fan and Liu, Chen and others},
-  journal={IEEE Transactions on Geoscience and Remote Sensing},
-  volume={61},
-  pages={1--14},
-  year={2023},
-  publisher={IEEE}
+@inproceedings{mazzeo2024spie_ueikap,
+  title={{UEIKAP: space-based ship wake detection integrating contextual meteo-marine knowledge of local sea state}},
+  author={Mazzeo, Andrea and Graziano, Maria Daniela and Vernengo, Giuliano and Bonaldo, Davide and Villa, Diego and others},
+  booktitle={Proceedings of SPIE, Vol. 13196},
+  year={2024},
+  doi={10.1117/12.3030884}
 }
 
-@dataset{mmdec2024,
-  author={Pelich, Ramona and Chierici, Marco and others},
-  title={{MMDEC: Multi-Modal Maritime Dataset of Earth Observation and AIS Data for Vessel Detection and Classification}},
+@article{xu2024opensarwake,
+  title={{OpenSARWake: A Large-Scale SAR Dataset for Ship Wake Recognition With a Feature Refinement Oriented Detector}},
+  author={Xu, Chengji and Wang, Xiaoqing},
+  journal={IEEE Geoscience and Remote Sensing Letters},
   year={2024},
+  publisher={IEEE},
+  doi={10.1109/LGRS.2024.3392681}
+}
+
+@dataset{averty_mmdec,
+  author={Averty, Tristan and Nasios, Ioannis and Ray, Cyril and Piliouras, Nikos},
+  title={{MMDEC: Multimodal Maritime Dataset on the English Channel}},
   publisher={Zenodo},
   doi={10.5281/zenodo.17491518},
   url={https://doi.org/10.5281/zenodo.17491518}
+}
+
+@phdthesis{higgins2023machine,
+  title={Machine Learning and Data Fusion of Simulated Remote Sensing Data},
+  author={Higgins, Erik T.},
+  school={Virginia Polytechnic Institute and State University},
+  year={2023}
 }
 
 @inproceedings{selvaraj2017gradcam,

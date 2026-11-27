@@ -222,12 +222,16 @@ def latlon_to_chunk_pixel(lat, lon, corner_row, chunk_size=800):
     return float(px[0]), float(px[1])
 
 
-def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=600):
+def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, past_window_sec=240, future_slack_sec=45, near_window_sec=105):
     """
-    1. Finds all AIS pings synchronized to a Sentinel-1 overpass (chunk_folder != null).
-    2. Loads +-window_sec AIS trajectory for each matched MMSI to compute unwrapped d(COG)/dt (deg/min).
-    3. Follows exact Maritime & UEIKAP sign convention:
-         ROT < 0 -> Port (Left), ROT > 0 -> Starboard (Right).
+    Causal Past-Wake AIS Kinematic Evaluator:
+      1. Finds all AIS pings synchronized to a Sentinel-1 overpass (chunk_folder != null).
+      2. Evaluates unwrapped d(COG)/dt strictly along the VISIBLE PAST WAKE window
+         [t0 - past_window_sec, t0 + future_slack_sec] (~4 min past wake + overpass)
+         plus the immediate near-hull window [t0 - near_window_sec, t0 + future_slack_sec].
+         This eliminates false Turning labels from vessels that turned only minutes AFTER
+         SAR capture (whose visible wake is straight) and preserves crisp short-duration turns
+         that a wide +/-10 min window previously smoothed out.
     """
     print(f"[MMDEC AIS] Scanning {ais_path} for Sentinel-1 synchronized ships...")
     cols = [
@@ -239,11 +243,9 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=600):
     df_all = table.to_pandas()
     print(f"[MMDEC AIS] Loaded {len(df_all):,} total AIS messages. Date dtype: {df_all['Date'].dtype}")
 
-    # Universal resolution-safe conversion to UTC epoch seconds (works on ns, us, ms, s)
     dt_utc = pd.to_datetime(df_all["Date"], utc=True)
     df_all["ts_sec"] = (dt_utc - pd.Timestamp("1970-01-01", tz="UTC")).dt.total_seconds().astype("int64")
 
-    # Synchronized overpass detections
     sync_df = df_all[df_all["chunk_folder"].notna() & df_all["id_chunk"].notna()].copy()
     sync_df = sync_df[
         (sync_df["SpeedOverGround"] >= min_sog) &
@@ -253,11 +255,9 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=600):
     sync_df["primary_chunk"] = sync_df["id_chunk"].apply(parse_id_chunk)
     sync_df = sync_df[sync_df["primary_chunk"].notna()].copy()
 
-    # Keep closest ping per (Mmsi, chunk_folder)
     sync_df = sync_df.drop_duplicates(subset=["Mmsi", "chunk_folder"]).reset_index(drop=True)
     print(f"[MMDEC AIS] Unique moving ships matched to S1 chunks: {len(sync_df):,}")
 
-    # Filter full AIS to matched MMSIs for fast trajectory grouping
     matched_mmsis = set(sync_df["Mmsi"].unique())
     traj_df = df_all[
         df_all["Mmsi"].isin(matched_mmsis) &
@@ -272,8 +272,20 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=600):
 
     del df_all, traj_df
 
+    def _fit_rot(ts_arr, cog_arr, t0, t_lo, t_hi):
+        m = (ts_arr >= t0 - t_lo) & (ts_arr <= t0 + t_hi)
+        tw = ts_arr[m]
+        cw = cog_arr[m]
+        if len(tw) >= 2 and (tw[-1] - tw[0]) >= 15:
+            unw = np.degrees(np.unwrap(np.radians(cw)))
+            dtm = (tw - t0) / 60.0
+            rot = float(np.polyfit(dtm, unw, 1)[0])
+            dcog = float(abs(unw[-1] - unw[0]))
+            return rot, dcog
+        return None, None
+
     records = []
-    for _, row in tqdm(sync_df.iterrows(), total=len(sync_df), desc="Computing unwrapped ROT"):
+    for _, row in tqdm(sync_df.iterrows(), total=len(sync_df), desc="Computing causal wake ROT"):
         mmsi = row["Mmsi"]
         t0 = row["ts_sec"]
         sog = float(row["SpeedOverGround"])
@@ -287,16 +299,20 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=600):
         delta_cog = None
 
         if ts_arr is not None:
-            mask = (ts_arr >= t0 - window_sec) & (ts_arr <= t0 + window_sec)
-            t_win = ts_arr[mask]
-            c_win = cog_arr[mask]
-            if len(t_win) >= 2 and (t_win[-1] - t_win[0]) >= 15:
-                unwrapped_deg = np.degrees(np.unwrap(np.radians(c_win)))
-                dt_min = (t_win - t0) / 60.0
-                rot_deg_min = float(np.polyfit(dt_min, unwrapped_deg, 1)[0])
-                delta_cog = float(abs(unwrapped_deg[-1] - unwrapped_deg[0]))
+            rot_wake, dc_wake = _fit_rot(ts_arr, cog_arr, t0, past_window_sec, future_slack_sec)
+            rot_near, dc_near = _fit_rot(ts_arr, cog_arr, t0, near_window_sec, future_slack_sec)
+            if rot_wake is not None:
+                rot_deg_min = rot_wake
+                delta_cog = dc_wake
+                # Capture sharp recent turns approaching SAR pass without averaging over straight approach
+                if rot_near is not None and abs(rot_near) > abs(rot_wake) and (rot_near * rot_wake >= 0.0 or dc_near >= 5.0):
+                    rot_deg_min = rot_near
+                    delta_cog = max(dc_wake, dc_near)
+            elif rot_near is not None:
+                rot_deg_min = rot_near
+                delta_cog = dc_near
 
-        # Fallback to ITU-R M.1371 RateOfTurn sensor decoding (including 0.0 for straight cruising!)
+        # Fallback to ITU-R M.1371 RateOfTurn sensor decoding
         if rot_deg_min is None:
             if -126.0 <= raw_rot <= 126.0:
                 rot_deg_min = float(np.sign(raw_rot) * ((abs(raw_rot) / 4.733) ** 2)) if raw_rot != 0.0 else 0.0
@@ -324,7 +340,7 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=600):
         })
 
     cand_df = pd.DataFrame(records)
-    print(f"[MMDEC AIS] Validated trajectories with exact ROT: {len(cand_df):,}")
+    print(f"[MMDEC AIS] Validated trajectories with causal wake ROT: {len(cand_df):,}")
     if len(cand_df) == 0:
         raise RuntimeError("No MMDEC AIS trajectories produced valid ROT. Check timestamp parsing and columns.")
     return cand_df
@@ -415,9 +431,10 @@ def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop
 
 def run_mmdec_harvest_and_mask(
     min_sog=3.5,
-    min_turn_rot=1.5,
+    min_turn_rot=1.25,
     max_straight=4000,
     max_turning=-1,
+    crop_size=640,
     batch_size=32,
     seed=42
 ):
@@ -434,28 +451,32 @@ def run_mmdec_harvest_and_mask(
     if not os.path.exists(chunks_zip_path):
         raise FileNotFoundError(f"Missing {chunks_zip_path}")
 
-    # 1. AIS Kinematic Ground-Truth + SatShipAI Open-Water Radar Confirmation
+    # 1. Causal Past-Wake AIS Kinematic Ground-Truth + SatShipAI Radar Confirmation
     cand_df = compute_kinematic_rot_from_ais(ais_path, min_sog=min_sog)
     sat_map = load_satshipai_index(MMDEC_DIR, min_det_prob=0.35, min_ship_len=30.0)
     cand_df = match_ais_to_satshipai(cand_df, sat_map, max_dist_m=1200.0, stride=750)
 
-    # Partition into Straight vs Turning (following exact UEIKAP maritime sign convention)
-    straight_pool = cand_df[(cand_df["rot_deg_min"].abs() < 0.45) & (cand_df["delta_cog_win"] < 2.5)].copy()
+    # Pure Straight vs Expanded Visible-Wake Turning (ROT >= min_turn_rot OR net wake arc >= 7.5 deg)
+    straight_pool = cand_df[
+        (cand_df["rot_deg_min"].abs() < 0.40) &
+        (cand_df["delta_cog_win"] < 2.5) &
+        (cand_df["course_heading_drift"].abs() < 6.0)
+    ].copy()
     straight_pool["state"] = "Straight"
     straight_pool["direction"] = "None"
     straight_pool["rot_target"] = 0.0
 
-    turning_pool = cand_df[cand_df["rot_deg_min"].abs() >= min_turn_rot].copy()
+    turn_cond = (cand_df["rot_deg_min"].abs() >= min_turn_rot) | (cand_df["delta_cog_win"] >= 7.5)
+    turning_pool = cand_df[turn_cond & (cand_df["rot_deg_min"].abs() >= 0.40)].copy()
     turning_pool["state"] = "Turning"
     turning_pool["direction"] = np.where(turning_pool["rot_deg_min"] < 0.0, "Port", "Starboard")
     turning_pool["rot_target"] = np.clip(turning_pool["rot_deg_min"], -12.0, 12.0)
 
-    print(f"\n[MMDEC HARVEST POOLS (SatShipAI Verified)]")
-    print(f"  Available Straight (|ROT|<0.45, dCOG<2.5): {len(straight_pool):,}")
-    print(f"  Available Turning (|ROT|>={min_turn_rot}):  {len(turning_pool):,} "
+    print(f"\n[MMDEC HARVEST POOLS (Causal Wake AIS)]")
+    print(f"  Available Straight (|ROT|<0.40, dCOG<2.5): {len(straight_pool):,}")
+    print(f"  Available Turning (|ROT|>={min_turn_rot} or dCOG>=7.5): {len(turning_pool):,} "
           f"(Port: {sum(turning_pool['direction']=='Port')}, Starboard: {sum(turning_pool['direction']=='Starboard')})")
 
-    # Subsample if capped, or take ALL if max_* == -1
     if max_turning > 0 and len(turning_pool) > max_turning:
         port_df = turning_pool[turning_pool["direction"] == "Port"]
         stbd_df = turning_pool[turning_pool["direction"] == "Starboard"]
@@ -474,17 +495,18 @@ def run_mmdec_harvest_and_mask(
 
     selected_df = pd.concat([turning_sel, straight_sel], ignore_index=True).sort_values(["product_id", "chunk_name"]).reset_index(drop=True)
     print(f"[MMDEC SELECTED] Harvesting {len(selected_df):,} ships "
-          f"(Turning={len(turning_sel)}, Straight={len(straight_sel)})...", flush=True)
+          f"(Turning={len(turning_sel)}, Straight={len(straight_sel)}) at {crop_size}x{crop_size} ({crop_size*10/1000:.1f} km FOV)...", flush=True)
 
-    # 2. Stream Crops Directly from Dataset_S1_chunks.zip (with LRU chunk cache)
+    # 2. Stream Wider Stitched Crops Directly from Dataset_S1_chunks.zip
     corners_map = load_corners_index(MMDEC_DIR)
     zip_lookup = build_zip_lookup(chunks_zip_path)
     print(f"[MMDEC ZIP INDEX] Indexed {len(zip_lookup):,} SAR chunks across {len(corners_map)} products.", flush=True)
 
+    ship_c = float(crop_size) * 0.5
     cropped_rows = []
     chunk_cache = OrderedDict()
     with zipfile.ZipFile(chunks_zip_path, "r") as zf:
-        for idx, row in tqdm(selected_df.iterrows(), total=len(selected_df), desc="Cropping SAR chips from zip"):
+        for idx, row in tqdm(selected_df.iterrows(), total=len(selected_df), desc=f"Cropping {crop_size}px SAR chips"):
             prod = row["product_id"]
             chunk = row["chunk_name"]
 
@@ -502,11 +524,10 @@ def run_mmdec_harvest_and_mask(
             if not (-50 <= ship_x <= 850 and -50 <= ship_y <= 850):
                 continue
 
-            crop = extract_stitched_crop(zf, zip_lookup, prod, chunk, ship_x, ship_y, crop_size=512, chunk_size=800, stride=750, chunk_cache=chunk_cache)
+            crop = extract_stitched_crop(zf, zip_lookup, prod, chunk, ship_x, ship_y, crop_size=crop_size, chunk_size=800, stride=750, chunk_cache=chunk_cache)
             if crop is None:
                 continue
 
-            # Skip crops with mostly zero padding (> 15% black edge / scene boundary)
             if np.mean(crop[:, :, 0] == 0) > 0.15:
                 continue
 
@@ -519,8 +540,8 @@ def run_mmdec_harvest_and_mask(
             rec["source_dataset"] = "MMDEC"
             rec["original_image_path"] = crop_path
             rec["crop_path"] = crop_path
-            rec["ship_x"] = 256.0
-            rec["ship_y"] = 256.0
+            rec["ship_x"] = ship_c
+            rec["ship_y"] = ship_c
             cropped_rows.append(rec)
 
     crop_df = pd.DataFrame(cropped_rows)
@@ -530,7 +551,6 @@ def run_mmdec_harvest_and_mask(
         raise RuntimeError("No MMDEC crops were extracted. Verify zip paths and chunk names.")
 
     # 3. Assign Strict Zero-Leakage Grouped Split (by MMSI & product_id) BEFORE Wake-Net Adaptation
-    # Guarantees pseudo-label domain adaptation uses ONLY MMDEC train crops (zero val/test contamination).
     unique_prods = sorted(crop_df["product_id"].unique())
     np.random.shuffle(unique_prods)
     n_tr = int(0.70 * len(unique_prods))
@@ -582,7 +602,7 @@ def run_mmdec_harvest_and_mask(
 
             for j in range(len(batch_paths)):
                 row_idx = start + j
-                prob_map = cv2.resize(probs[j, 0], (512, 512), interpolation=cv2.INTER_LINEAR)
+                prob_map = cv2.resize(probs[j, 0], (crop_size, crop_size), interpolation=cv2.INTER_LINEAR)
                 if use_hysteresis:
                     bin_mask = hysteresis_wake_mask(prob_map, seed_thresh=mmdec_seed_thresh, grow_thresh=mmdec_grow_thresh, min_size=30)
                 else:
@@ -592,7 +612,7 @@ def run_mmdec_harvest_and_mask(
                 cv2.imwrite(m_path, bin_mask)
                 out_masks.append(m_path)
                 if use_hysteresis:
-                    out_radon.append(compute_radon_wake_kinematics(bin_mask, sog_knots=crop_df.iloc[row_idx]["sog"], ship_point=(256.0, 256.0)))
+                    out_radon.append(compute_radon_wake_kinematics(bin_mask, sog_knots=crop_df.iloc[row_idx]["sog"], ship_point=(ship_c, ship_c)))
         return out_masks, out_radon
 
     if wn_in_ch == 3:
@@ -621,7 +641,7 @@ def run_mmdec_harvest_and_mask(
     )
     geom_rows = []
     for _, row in tqdm(crop_df.iterrows(), total=len(crop_df), desc="Extracting wake geometry"):
-        geom = extract_wake_features_from_mask(row["wake_mask_path"], ship_point=(256.0, 256.0))
+        geom = extract_wake_features_from_mask(row["wake_mask_path"], ship_point=(ship_c, ship_c))
         if geom is not None:
             rec_g = {
                 "geometry_valid": True,
@@ -643,7 +663,7 @@ def run_mmdec_harvest_and_mask(
         else:
             bgr = cv2.imread(row["crop_path"], cv2.IMREAD_COLOR)
             sar_g = extract_unified_sar_gray(bgr) if bgr is not None else None
-            fallback_ang = estimate_sar_streak_angle_deg(sar_g, ship_point=(256.0, 256.0))
+            fallback_ang = estimate_sar_streak_angle_deg(sar_g, ship_point=(ship_c, ship_c))
             rec_g = {
                 "geometry_valid": False,
                 "wake_length": 0.0,
@@ -719,11 +739,12 @@ def run_mmdec_harvest_and_mask(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MMDEC Harvester + AIS ROT + Wake-Net Auto-Masker")
+    parser = argparse.ArgumentParser(description="MMDEC Harvester + Causal Wake AIS ROT + Wake-Net Auto-Masker")
     parser.add_argument("--min_sog", type=float, default=3.5)
-    parser.add_argument("--min_turn_rot", type=float, default=1.5)
+    parser.add_argument("--min_turn_rot", type=float, default=1.25)
     parser.add_argument("--max_straight", type=int, default=4000, help="-1 for all available straight ships")
     parser.add_argument("--max_turning", type=int, default=-1, help="-1 for all available turning ships")
+    parser.add_argument("--crop_size", type=int, default=640, help="Spatial FOV in pixels (10m/px -> 640px=6.4km)")
     parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 
@@ -732,5 +753,6 @@ if __name__ == "__main__":
         min_turn_rot=args.min_turn_rot,
         max_straight=args.max_straight,
         max_turning=args.max_turning,
+        crop_size=args.crop_size,
         batch_size=args.batch_size
     )
