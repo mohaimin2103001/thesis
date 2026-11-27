@@ -222,16 +222,15 @@ def latlon_to_chunk_pixel(lat, lon, corner_row, chunk_size=800):
     return float(px[0]), float(px[1])
 
 
-def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, past_window_sec=240, future_slack_sec=45, near_window_sec=105):
+def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, window_sec=600, wake_past_sec=300, wake_future_sec=60, min_span_sec=60):
     """
-    Causal Past-Wake AIS Kinematic Evaluator:
+    Trajectory-Verified AIS Kinematic ROT Estimator (Zero Unverified Sensor Fallback):
       1. Finds all AIS pings synchronized to a Sentinel-1 overpass (chunk_folder != null).
-      2. Evaluates unwrapped d(COG)/dt strictly along the VISIBLE PAST WAKE window
-         [t0 - past_window_sec, t0 + future_slack_sec] (~4 min past wake + overpass)
-         plus the immediate near-hull window [t0 - near_window_sec, t0 + future_slack_sec].
-         This eliminates false Turning labels from vessels that turned only minutes AFTER
-         SAR capture (whose visible wake is straight) and preserves crisp short-duration turns
-         that a wide +/-10 min window previously smoothed out.
+      2. Fits unwrapped d(COG)/dt ONLY from genuine multi-ping GPS trajectories spanning >= min_span_sec.
+      3. Prefers the causal wake-formation window [t0 - wake_past_sec, t0 + wake_future_sec] when available
+         (>= 2 pings, >= min_span_sec), falling back cleanly to +/-window_sec trajectory fit for sparse
+         offshore AIS pings. NEVER falls back to uncalibrated onboard RateOfTurn sensor bytes when
+         trajectory pings are missing (which empirically introduced ~84% mislabeled Straight-as-Turning ships).
     """
     print(f"[MMDEC AIS] Scanning {ais_path} for Sentinel-1 synchronized ships...")
     cols = [
@@ -276,7 +275,7 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, past_window_sec=240, f
         m = (ts_arr >= t0 - t_lo) & (ts_arr <= t0 + t_hi)
         tw = ts_arr[m]
         cw = cog_arr[m]
-        if len(tw) >= 2 and (tw[-1] - tw[0]) >= 15:
+        if len(tw) >= 2 and (tw[-1] - tw[0]) >= min_span_sec:
             unw = np.degrees(np.unwrap(np.radians(cw)))
             dtm = (tw - t0) / 60.0
             rot = float(np.polyfit(dtm, unw, 1)[0])
@@ -285,7 +284,8 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, past_window_sec=240, f
         return None, None
 
     records = []
-    for _, row in tqdm(sync_df.iterrows(), total=len(sync_df), desc="Computing causal wake ROT"):
+    skipped_no_traj = 0
+    for _, row in tqdm(sync_df.iterrows(), total=len(sync_df), desc="Computing trajectory-verified ROT"):
         mmsi = row["Mmsi"]
         t0 = row["ts_sec"]
         sog = float(row["SpeedOverGround"])
@@ -299,26 +299,27 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, past_window_sec=240, f
         delta_cog = None
 
         if ts_arr is not None:
-            rot_wake, dc_wake = _fit_rot(ts_arr, cog_arr, t0, past_window_sec, future_slack_sec)
-            rot_near, dc_near = _fit_rot(ts_arr, cog_arr, t0, near_window_sec, future_slack_sec)
-            if rot_wake is not None:
+            rot_full, dc_full = _fit_rot(ts_arr, cog_arr, t0, window_sec, window_sec)
+            rot_wake, dc_wake = _fit_rot(ts_arr, cog_arr, t0, wake_past_sec, wake_future_sec)
+            if rot_wake is not None and rot_full is not None:
+                # Prefer wake-history ROT if signs agree or sharp maneuver started cleanly before overpass
+                if (rot_wake * rot_full >= 0.0 and abs(rot_wake) > abs(rot_full)) or dc_wake >= 6.0:
+                    rot_deg_min = rot_wake
+                    delta_cog = max(dc_wake, dc_full)
+                else:
+                    rot_deg_min = rot_full
+                    delta_cog = dc_full
+            elif rot_full is not None:
+                rot_deg_min = rot_full
+                delta_cog = dc_full
+            elif rot_wake is not None:
                 rot_deg_min = rot_wake
                 delta_cog = dc_wake
-                # Capture sharp recent turns approaching SAR pass without averaging over straight approach
-                if rot_near is not None and abs(rot_near) > abs(rot_wake) and (rot_near * rot_wake >= 0.0 or dc_near >= 5.0):
-                    rot_deg_min = rot_near
-                    delta_cog = max(dc_wake, dc_near)
-            elif rot_near is not None:
-                rot_deg_min = rot_near
-                delta_cog = dc_near
 
-        # Fallback to ITU-R M.1371 RateOfTurn sensor decoding
+        # Strictly require multi-ping trajectory verification (NO unverified raw_rot sensor fallback!)
         if rot_deg_min is None:
-            if -126.0 <= raw_rot <= 126.0:
-                rot_deg_min = float(np.sign(raw_rot) * ((abs(raw_rot) / 4.733) ** 2)) if raw_rot != 0.0 else 0.0
-                delta_cog = abs(rot_deg_min) * 2.0
-            else:
-                continue
+            skipped_no_traj += 1
+            continue
 
         if abs(rot_deg_min) > 25.0:
             continue
@@ -340,7 +341,7 @@ def compute_kinematic_rot_from_ais(ais_path, min_sog=3.0, past_window_sec=240, f
         })
 
     cand_df = pd.DataFrame(records)
-    print(f"[MMDEC AIS] Validated trajectories with causal wake ROT: {len(cand_df):,}")
+    print(f"[MMDEC AIS] Pure trajectory-verified ships: {len(cand_df):,} (dropped {skipped_no_traj:,} without >= {min_span_sec}s trajectory span)")
     if len(cand_df) == 0:
         raise RuntimeError("No MMDEC AIS trajectories produced valid ROT. Check timestamp parsing and columns.")
     return cand_df
@@ -431,10 +432,10 @@ def extract_stitched_crop(zf, zip_lookup, prod, chunk_name, ship_x, ship_y, crop
 
 def run_mmdec_harvest_and_mask(
     min_sog=3.5,
-    min_turn_rot=1.25,
+    min_turn_rot=1.5,
     max_straight=4000,
     max_turning=-1,
-    crop_size=640,
+    crop_size=512,
     batch_size=32,
     seed=42
 ):
@@ -741,10 +742,10 @@ def run_mmdec_harvest_and_mask(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MMDEC Harvester + Causal Wake AIS ROT + Wake-Net Auto-Masker")
     parser.add_argument("--min_sog", type=float, default=3.5)
-    parser.add_argument("--min_turn_rot", type=float, default=1.25)
+    parser.add_argument("--min_turn_rot", type=float, default=1.5)
     parser.add_argument("--max_straight", type=int, default=4000, help="-1 for all available straight ships")
     parser.add_argument("--max_turning", type=int, default=-1, help="-1 for all available turning ships")
-    parser.add_argument("--crop_size", type=int, default=640, help="Spatial FOV in pixels (10m/px -> 640px=6.4km)")
+    parser.add_argument("--crop_size", type=int, default=512, help="Spatial FOV in pixels (10m/px -> 512px=5.1km)")
     parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 

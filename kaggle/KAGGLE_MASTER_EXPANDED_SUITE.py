@@ -195,7 +195,7 @@ class DualScaleWakeNet(nn.Module):
         the bottom edge and the FULL trailing wake plume stretches vertically across View 2!
       - Spatial Wake-Attention Pooling + Auxiliary Mask Supervision Map (Macro)
     """
-    def __init__(self, backbone_name="convnext_small", num_physics_features=20, pretrained=True):
+    def __init__(self, backbone_name="convnext_tiny", num_physics_features=20, pretrained=True):
         super().__init__()
         self.backbone_name = backbone_name
         self.speckle_filter = LeeSpeckleFilter(kernel_size=7, noise_var=0.08)
@@ -203,8 +203,8 @@ class DualScaleWakeNet(nn.Module):
             backbone_name,
             pretrained=pretrained,
             num_classes=0,
-            drop_rate=0.30,
-            drop_path_rate=0.30,
+            drop_rate=0.25,
+            drop_path_rate=0.25,
         )
         embed_dim = int(self.backbone.num_features)
         self.embed_dim = embed_dim
@@ -248,17 +248,16 @@ class DualScaleWakeNet(nn.Module):
         if self.training:
             ang = ang + (torch.rand(bsz, device=x_macro.device) * 0.16 - 0.08)
             alpha = ang + (math.pi * 0.5)
-            scale = 0.52 + 0.10 * torch.rand(bsz, device=x_macro.device)
-            shift = torch.full((bsz,), 0.26, device=x_macro.device) + (torch.rand(bsz, device=x_macro.device) * 0.06 - 0.03)
+            scale = 0.50 + 0.12 * torch.rand(bsz, device=x_macro.device)
+            tx = torch.rand(bsz, device=x_macro.device) * 0.08 - 0.04
+            ty = torch.rand(bsz, device=x_macro.device) * 0.08 - 0.04
         else:
-            scale = torch.full((bsz,), 0.56, device=x_macro.device)
-            shift = torch.full((bsz,), 0.26, device=x_macro.device)
+            scale = torch.full((bsz,), 0.55, device=x_macro.device)
+            tx = torch.zeros(bsz, device=x_macro.device)
+            ty = torch.zeros(bsz, device=x_macro.device)
 
         cos_a = torch.cos(alpha) * scale
         sin_a = torch.sin(alpha) * scale
-        # Translate window center along wake vector (cos(ang), sin(ang)) so stern anchors near bottom!
-        tx = shift * torch.cos(ang)
-        ty = shift * torch.sin(ang)
         theta = torch.stack([
             torch.stack([cos_a, -sin_a, tx], dim=1),
             torch.stack([sin_a, cos_a, ty], dim=1),
@@ -506,7 +505,7 @@ class ScaledManeuverDataset(Dataset):
 
 
 class PhysicsInformedMultiTaskLoss(nn.Module):
-    def __init__(self, pos_weight=1.35, label_smooth=0.04, dir_weights=None, lambda_dir=0.45, lambda_lr=0.40, lambda_rot=0.20, lambda_phys=0.10, lambda_spatial=0.25):
+    def __init__(self, pos_weight=1.30, label_smooth=0.0, dir_weights=None, lambda_dir=0.45, lambda_lr=0.40, lambda_rot=0.20, lambda_phys=0.10, lambda_spatial=0.25):
         super().__init__()
         self.pos_weight = pos_weight
         self.label_smooth = label_smooth
@@ -986,13 +985,13 @@ def generate_lee_vs_raw_gradcam(convnext_net, test_ds, out_dir, num_per_class=-1
         pd.DataFrame(audit_rows).to_csv(os.path.join(TABLES_DIR, "convnext_gradcam_analysis.csv"), index=False)
 
 
-def _train_vision_backbone(model, model_tag, ckpt_name, train_loader, val_loader, train_ds, val_ds, epochs, lr, backbone_lr_mult=0.28, patience=5):
+def _train_vision_backbone(model, model_tag, ckpt_name, train_loader, val_loader, train_ds, val_ds, epochs, lr, backbone_lr_mult=0.35, patience=15):
     """
-    AMP cosine training loop with Exponential Moving Average (EMA, decay=0.995),
-    Early Stopping (patience=5), and Train-vs-Val Overfit Gap Audit.
+    AMP cosine training loop with best-validation generalization checkpointing
+    and Train-vs-Val Overfit Gap Audit.
     """
     dir_weights = np.array([0.85, 1.15, 1.15], dtype=np.float32)
-    criterion = PhysicsInformedMultiTaskLoss(pos_weight=1.35, label_smooth=0.04, dir_weights=dir_weights).to(DEVICE)
+    criterion = PhysicsInformedMultiTaskLoss(pos_weight=1.30, label_smooth=0.0, dir_weights=dir_weights).to(DEVICE)
     opt = torch.optim.AdamW([
         {"params": model.backbone.parameters(), "lr": lr * backbone_lr_mult},
         {"params": model.spatial_attn.parameters(), "lr": lr},
@@ -1002,18 +1001,13 @@ def _train_vision_backbone(model, model_tag, ckpt_name, train_loader, val_loader
         {"params": model.direction_head.parameters(), "lr": lr},
         {"params": model.turn_lr_head.parameters(), "lr": lr},
         {"params": model.rot_head.parameters(), "lr": lr},
-    ], weight_decay=2e-2)
-    warmup_ep = min(3, max(1, epochs // 7))
+    ], weight_decay=1e-2)
+    warmup_ep = min(2, max(1, epochs // 8))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt,
-        lr_lambda=lambda e: (e + 1) / warmup_ep if e < warmup_ep else max(0.02, 0.5 * (1.0 + math.cos(math.pi * (e - warmup_ep) / max(1, epochs - warmup_ep)))),
+        lr_lambda=lambda e: (e + 1) / warmup_ep if e < warmup_ep else max(0.01, 0.5 * (1.0 + math.cos(math.pi * (e - warmup_ep) / max(1, epochs - warmup_ep)))),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
-
-    ema_model = copy.deepcopy(model).to(DEVICE)
-    for p in ema_model.parameters():
-        p.requires_grad_(False)
-    ema_decay = 0.995
 
     best_score = -1.0
     best_val_auc = 0.5
@@ -1034,19 +1028,9 @@ def _train_vision_backbone(model, model_tag, ckpt_name, train_loader, val_loader
                 loss = criterion(st_log, dir_log, rot_out, lr_log, attn_macro, imgs, state_t, dir_t, rot_t)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
             scaler.step(opt)
             scaler.update()
-
-            # EMA parameter update after epoch 1
-            with torch.no_grad():
-                if ep == 1:
-                    ema_model.load_state_dict(model.state_dict())
-                else:
-                    for ep_p, mp in zip(ema_model.parameters(), model.parameters()):
-                        ep_p.data.mul_(ema_decay).add_(mp.data, alpha=(1.0 - ema_decay))
-                    for ep_b, mb in zip(ema_model.buffers(), model.buffers()):
-                        ep_b.copy_(mb)
 
             tot_loss += loss.item() * len(state_t)
             tr_probs_b.append(torch.sigmoid(st_log.detach()).cpu().numpy())
@@ -1056,21 +1040,18 @@ def _train_vision_backbone(model, model_tag, ckpt_name, train_loader, val_loader
         tr_p = np.concatenate(tr_probs_b); tr_y = np.concatenate(tr_true_b)
         tr_auc = float(roc_auc_score(tr_y, tr_p)) if len(np.unique(tr_y)) > 1 else 0.5
 
-        eval_net = ema_model if ep >= 2 else model
-        eval_net.eval()
+        model.eval()
         vp, vdir, vrot = [], [], []
         with torch.no_grad():
             for imgs, phys, _, ang, _, _, _ in val_loader:
-                st_l, dir_l, rot_l, _ = eval_net(imgs.to(DEVICE), phys.to(DEVICE), ang.to(DEVICE))
+                st_l, dir_l, rot_l, _ = model(imgs.to(DEVICE), phys.to(DEVICE), ang.to(DEVICE))
                 vp.append(torch.sigmoid(st_l).cpu().numpy())
                 vdir.append(torch.softmax(dir_l, dim=1).cpu().numpy())
                 vrot.append(rot_l.cpu().numpy())
         vp = np.concatenate(vp); vdir = np.concatenate(vdir); vrot = np.concatenate(vrot)
         vr = evaluate_predictions(vp, vdir, vrot, val_ds.state_labels, val_ds.dir_labels, val_ds.rot_values, tau=0.50)
 
-        # Penalize if train_auc far exceeds val_auc (guards against overfitting!)
-        gap = max(0.0, tr_auc - vr["auc_roc"])
-        score = 0.70 * vr["auc_roc"] + 0.30 * vr["balanced_accuracy"] - 0.08 * max(0.0, gap - 0.12)
+        score = 0.65 * vr["auc_roc"] + 0.35 * vr["balanced_accuracy"]
 
         print(f"[{model_tag}] Ep {ep:02d}/{epochs:02d} | Loss:{tot_loss/max(1,len(train_loader.dataset)):.4f} | "
               f"TrainAUC:{tr_auc:.3f} | ValAUC:{vr['auc_roc']:.4f} (Gap:{tr_auc-vr['auc_roc']:+.3f}) | "
@@ -1081,10 +1062,10 @@ def _train_vision_backbone(model, model_tag, ckpt_name, train_loader, val_loader
             best_val_auc = vr["auc_roc"]
             best_train_auc = tr_auc
             no_improve = 0
-            torch.save(eval_net.state_dict(), ckpt_path)
+            torch.save(model.state_dict(), ckpt_path)
         else:
             no_improve += 1
-            if no_improve >= patience and ep >= warmup_ep + 4:
+            if no_improve >= patience and ep >= warmup_ep + 6:
                 print(f"[{model_tag}] Early stopping at epoch {ep} (no val improvement for {patience} epochs; prevents overfit).")
                 break
 
@@ -1110,14 +1091,14 @@ def _load_backbone_safe(candidates, num_physics_features, pretrained):
 
 
 def run_master_suite(
-    epochs=18,
+    epochs=20,
     batch_size=24,
     lr=2e-4,
     img_size=256,
     gradcam_per_class=-1,
-    primary_backbone="convnext_small",
+    primary_backbone="convnext_tiny",
     second_backbone="swinv2_tiny_window8_256",
-    third_backbone="resnet50d",
+    third_backbone="none",
     allow_partial_data=False,
     pretrained=True,
 ):
@@ -1179,7 +1160,7 @@ def run_master_suite(
     p_net, p_name = _load_backbone_safe([primary_backbone, "convnext_tiny"], len(PHYSICS_FEATURES), pretrained)
     p_net, p_audit = _train_vision_backbone(
         p_net, f"Primary-{p_name}", "convnext_multitask_best.pt",
-        train_loader, val_loader, train_ds, val_ds, epochs=epochs, lr=lr, backbone_lr_mult=0.25, patience=5,
+        train_loader, val_loader, train_ds, val_ds, epochs=epochs, lr=lr, backbone_lr_mult=0.35, patience=15,
     )
     overfit_audit[p_name] = p_audit
     vision_nets.append(p_net); vision_names.append(p_name)
@@ -1189,7 +1170,7 @@ def run_master_suite(
         if s_net is not None:
             s_net, s_audit = _train_vision_backbone(
                 s_net, f"Second-{s_name}", "second_backbone_best.pt",
-                train_loader, val_loader, train_ds, val_ds, epochs=epochs, lr=lr, backbone_lr_mult=0.30, patience=5,
+                train_loader, val_loader, train_ds, val_ds, epochs=epochs, lr=lr, backbone_lr_mult=0.35, patience=15,
             )
             overfit_audit[s_name] = s_audit
             vision_nets.append(s_net); vision_names.append(s_name)
@@ -1199,7 +1180,7 @@ def run_master_suite(
         if r_net is not None:
             r_net, r_audit = _train_vision_backbone(
                 r_net, f"Third-{r_name}", "third_backbone_best.pt",
-                train_loader, val_loader, train_ds, val_ds, epochs=max(2, epochs - 2), lr=lr, backbone_lr_mult=0.35, patience=5,
+                train_loader, val_loader, train_ds, val_ds, epochs=max(2, epochs - 2), lr=lr, backbone_lr_mult=0.35, patience=15,
             )
             overfit_audit[r_name] = r_audit
             vision_nets.append(r_net); vision_names.append(r_name)
@@ -1246,9 +1227,9 @@ def run_master_suite(
 
     val_hgb, test_hgb = train_and_predict_hgb(train_ds, [val_ds, test_ds])
 
-    # Run Full 8x Chiral D4 TTA across all trained EMA vision models
-    val_neural = predict_neural_branches(vision_nets, geom_mlp, val_loader, train_ds.phys_mean, train_ds.phys_std, train_ds.geom_indices, tta_mode="8x")
-    test_neural = predict_neural_branches(vision_nets, geom_mlp, test_loader, train_ds.phys_mean, train_ds.phys_std, train_ds.geom_indices, tta_mode="8x")
+    # Run 4x Chiral D4 TTA across all trained vision models
+    val_neural = predict_neural_branches(vision_nets, geom_mlp, val_loader, train_ds.phys_mean, train_ds.phys_std, train_ds.geom_indices, tta_mode="4x")
+    test_neural = predict_neural_branches(vision_nets, geom_mlp, test_loader, train_ds.phys_mean, train_ds.phys_std, train_ds.geom_indices, tta_mode="4x")
 
     v_st_t = val_ds.state_labels
     v_dir_t = val_ds.dir_labels
@@ -1294,7 +1275,7 @@ def run_master_suite(
                     st_a = float(np.mean(b[v_st_t == 0] == 0))
                     tu_a = float(np.mean(b[v_st_t == 1] == 1))
                     bal = 0.5 * (st_a + tu_a)
-                    obj = 0.55 * bal + 0.25 * v_auc + 0.20 * min(st_a, tu_a)
+                    obj = 0.60 * bal + 0.25 * v_auc + 0.15 * min(st_a, tu_a)
                     if obj > best_val_obj:
                         best_val_obj = obj
                         best_vis_w = [w * w_vis for w in vw]
@@ -1361,7 +1342,7 @@ def run_master_suite(
         tau=best_tau, p_stbd_cond=t_stbd_cond, tau_lr=best_tau_lr,
     )
     full_metrics["calibrated_weights"] = weights_dict
-    full_metrics["tta_mode"] = "8x_D4_Chiral"
+    full_metrics["tta_mode"] = "4x_D4_Chiral"
     full_metrics["latency_ms_per_ship"] = float(test_neural["mean_latency_s"] * 1000.0)
     full_metrics["throughput_fps"] = float(1.0 / (test_neural["mean_latency_s"] + 1e-6))
 
@@ -1426,7 +1407,7 @@ def run_master_suite(
     results["top_physics_features"] = imp_df.head(6).to_dict("records")
 
     print("\n" + "=" * 80)
-    print("FINAL PUBLICATION BENCHMARK SUMMARY (STERN-ALIGNED + EMA + 3-BACKBONE + 8x D4 TTA)")
+    print("FINAL PUBLICATION BENCHMARK SUMMARY (STERN-ALIGNED + D4 TTA + OVERFIT AUDIT)")
     print("=" * 80)
     print(json.dumps(results, indent=2))
 
@@ -1457,13 +1438,13 @@ def run_master_suite(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Stern-Aligned Anti-Overfit Multi-Backbone Ensemble")
-    parser.add_argument("--epochs", type=int, default=18)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--img_size", type=int, default=256)
-    parser.add_argument("--primary_backbone", type=str, default="convnext_small")
+    parser.add_argument("--primary_backbone", type=str, default="convnext_tiny")
     parser.add_argument("--second_backbone", type=str, default="swinv2_tiny_window8_256")
-    parser.add_argument("--third_backbone", type=str, default="resnet50d")
+    parser.add_argument("--third_backbone", type=str, default="none")
     parser.add_argument("--gradcam_per_class", type=int, default=-1, help="-1 generates all, 0 skips")
     parser.add_argument("--allow_partial_data", action="store_true")
     parser.add_argument("--no_pretrained", action="store_true")
