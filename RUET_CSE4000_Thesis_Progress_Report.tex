@@ -688,6 +688,7 @@ Scientific verification confirms that predictions trace real hydrodynamic wakes 
     \item \textbf{Permutation Feature Importance (Figure~\ref{fig:explain_mc}a \& Table~\ref{tab:perm_top}):} Shuffling individual physics descriptors degrades Balanced Accuracy most heavily for \texttt{pca\_width} ($-2.15\%$), \texttt{pca\_abs\_defl\_deg} ($-1.81\%$), \texttt{pca\_signed\_defl\_deg} ($-1.77\%$), \texttt{radon\_angle\_deg} ($-1.69\%$), \texttt{pca\_bend\_px} ($-1.69\%$), and \texttt{signed\_mean\_curvature} ($-1.65\%$).
     \item \textbf{MC-Dropout Epistemic Triage (Figure~\ref{fig:explain_mc}b \& Table~\ref{tab:mc_curve}):} Misclassified ships carry higher predictive entropy ($0.6551$ vs.\ $0.6231$). Progressive rejection of high-entropy clutter raises ensemble discrimination smoothly up to \textbf{0.9001 ROC-AUC}.
     \item \textbf{Causal Counterfactuals \& Stress Testing (Figures~\ref{fig:counter_domain}a--b \& \ref{fig:failure_gallery}):} Counterfactual perturbations verify that erasing wakes reduces State F1 from $0.856$ to $0.541$ while erasing hulls retains $0.812$. Domain stress tests quantify tolerance under Rayleigh speckle, calm dimming, and downsampled wide-swath modes.
+    \item \textbf{Grad-CAM Spatial Attribution Audit (Figure~\ref{fig:gradcam_showcase}):} Across all 594 clean test instances (backed by 2,013 synced clean-run \texttt{outputs/gradcam\_convnext} visualizations and trained \texttt{ConvNeXt-Tiny}, \texttt{SwinV2-Tiny} [\texttt{second\_backbone\_best.pt}], \texttt{Geometry MLP}, and \texttt{Wake-Net} checkpoints), Grad-CAM maps confirm localized attention along segmented wake contours and hull-wake junctions across both open-ocean Straight and Turning vessels.
 \end{enumerate}
 
 \begin{table}[H]
@@ -750,6 +751,13 @@ Scientific verification confirms that predictions trace real hydrodynamic wakes 
 \includegraphics[width=0.90\textwidth]{latex_assets/fig_failure_gallery.png}
 \caption{Qualitative hydrodynamic failure gallery cataloging primary error mechanisms under low Froude number ($U < 6$\,kt), gale-force wave clutter masking, and steep incidence geometry.}
 \label{fig:failure_gallery}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.84\textwidth]{latex_assets/fig_gradcam_clean_showcase.png}
+\caption{Clean-run ConvNeXt Grad-CAM visual attribution showcase extracted from \texttt{master\_thesis\_results\_clean.zip} (\texttt{N\_test = 594} clean cohort): raw SAR crop, $7\times 7$ Lee-filtered input, and Grad-CAM heatmaps overlaid with segmented wake contours (white outlines) for representative (a) MMDEC Straight, (b) UEIKAP Straight, (c) UEIKAP Port Turning, and (d) UEIKAP Starboard Turning detections.}
+\label{fig:gradcam_showcase}
 \end{figure}
 
 % ============================================================================
